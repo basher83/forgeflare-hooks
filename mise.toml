@@ -1,0 +1,63 @@
+[settings]
+experimental = true
+
+[env]
+RUST_BACKTRACE = "1"
+
+# ── Tools ─────────────────────────────────────────────────
+[tools]
+rust = { version = "stable", components = "rustfmt,clippy" }
+"cargo:cargo-audit" = "latest"
+ripgrep = "latest"
+
+# ── Format ────────────────────────────────────────────────
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt"
+
+[tasks."fmt:check"]
+description = "Check formatting (no changes)"
+run = "cargo fmt --check"
+
+# ── Lint ──────────────────────────────────────────────────
+[tasks.lint]
+description = "Run clippy with warnings as errors"
+run = "cargo clippy -- -D warnings"
+
+# ── Build ─────────────────────────────────────────────────
+[tasks.build]
+description = "Debug build"
+run = "cargo build"
+
+[tasks."build:release"]
+description = "Release build"
+run = "cargo build --release"
+
+# ── Test ──────────────────────────────────────────────────
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
+
+# ── Audit ─────────────────────────────────────────────────
+[tasks.audit]
+description = "Security audit of dependencies"
+run = "cargo audit"
+
+# ── Composite ─────────────────────────────────────────────
+[tasks.check]
+description = "Full pre-commit check: fmt → lint → build → test (sequential)"
+depends = ["fmt:check"]
+run = [
+  "cargo clippy -- -D warnings",
+  "cargo build",
+  "cargo test",
+]
+
+[tasks.ci]
+description = "Full CI-equivalent pipeline"
+depends = ["check", "audit"]
+
+# ── Clean ─────────────────────────────────────────────────
+[tasks.clean]
+description = "Remove build artifacts"
+run = "cargo clean"

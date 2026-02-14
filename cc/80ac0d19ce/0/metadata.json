@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.4.4",
+  "checkpoint_id": "cc80ac0d19ce",
+  "session_id": "12fff115-e334-49ed-a3e1-198fbdedf5bf",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-14T11:45:33.71734Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "IMPLEMENTATION_PLAN.md"
+  ],
+  "agent": "Claude Code",
+  "token_usage": {
+    "input_tokens": 10,
+    "cache_creation_tokens": 59101,
+    "cache_read_tokens": 542210,
+    "output_tokens": 58,
+    "api_call_count": 9
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-14T11:45:33.620786Z",
+    "agent_lines": 115,
+    "human_added": 33,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 148,
+    "agent_percentage": 77.7027027027027
+  },
+  "transcript_path": ".claude/projects/-Users-basher8383-dev-forge-forgeflare-hooks/12fff115-e334-49ed-a3e1-198fbdedf5bf.jsonl"
+}

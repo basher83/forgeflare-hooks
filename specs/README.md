@@ -11,16 +11,19 @@
 | Active | `maxtoken-continuation.md` | Continue from MaxTokens truncation instead of breaking inner loop | `src/main.rs` |
 | Active | `token-aware-trim.md` | Use API token counts to skip unnecessary context trimming | `src/main.rs` |
 | Active | `hooks.md` | Shell-based hook dispatch: PreToolUse guard, PostToolUse observation, Stop finalization | `src/hooks.rs` (new), `src/main.rs` |
-| Complete | `tool-name-compliance.md` | Rename tool names to match Claude Code conventions for OAuth proxy compatibility | `src/tools/mod.rs`, `src/main.rs` |
+| Active | `tool-name-compliance.md` | Rename tool names to match Claude Code conventions for OAuth proxy compatibility | `src/tools/mod.rs`, `src/main.rs` |
 
 ## Implementation Order
 
 Specs modify overlapping code in `main.rs` and `api.rs`. Implement in this order to avoid structural conflicts:
 
-1. `api-endpoint.md` — changes `AnthropicClient::new` signature and CLI struct
-2. `api-retry.md` — splits error variants, wraps `send_message()` in retry loop
-3. `session-capture.md` — needs usage data from `send_message()` return tuple
-4. `maxtoken-continuation.md` — restructures inner loop control flow (stop_reason handling)
-5. `token-aware-trim.md` — reads usage after the retry loop, gates trim decisions
-6. `tool-parallelism.md` — modifies the tool dispatch block (independent of control flow changes above)
-7. `hooks.md` — wraps tool dispatch with hook calls (depends on final shape of both sequential and parallel paths)
+1. `coding-agent.md` — foundation: CLI, streaming API client, 5 tools, conversation loop
+2. `tool-name-compliance.md` — PascalCase tool names for OAuth proxy compatibility (must be applied during initial tool implementation)
+3. `api-endpoint.md` — changes `AnthropicClient::new` signature and CLI struct
+4. `api-retry.md` — splits error variants, wraps `send_message()` in retry loop
+5. `session-capture.md` — needs usage data from `send_message()` return tuple
+6. `maxtoken-continuation.md` — restructures inner loop control flow (stop_reason handling)
+7. `token-aware-trim.md` — reads usage after the retry loop, gates trim decisions
+8. `tool-parallelism.md` — modifies the tool dispatch block (independent of control flow changes above)
+9. `hooks.md` — wraps tool dispatch with hook calls (depends on final shape of both sequential and parallel paths)
+10. `release-workflow.md` — GitHub Actions workflow (independent of Rust code, can be done anytime after build works)

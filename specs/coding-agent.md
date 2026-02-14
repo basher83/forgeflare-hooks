@@ -84,18 +84,18 @@ reference/
 
 ## Success Criteria
 
-- [x] Binary compiles (`cargo build`)
-- [x] Tests pass (`cargo test`)
-- [x] Clippy clean (`cargo clippy -- -D warnings`)
-- [x] Formatted (`cargo fmt --check`)
-- [x] Can chat with Claude
-- [x] Can read files
-- [x] Can list directories
-- [x] Can run bash commands
-- [x] Can edit files (exact-match semantics)
-- [x] Can search code
-- [x] <950 production lines (~900 actual after streaming + replace_all)
-- [x] Streaming responses visible to user in real-time
+- [ ] Binary compiles (`cargo build`)
+- [ ] Tests pass (`cargo test`)
+- [ ] Clippy clean (`cargo clippy -- -D warnings`)
+- [ ] Formatted (`cargo fmt --check`)
+- [ ] Can chat with Claude
+- [ ] Can read files
+- [ ] Can list directories
+- [ ] Can run bash commands
+- [ ] Can edit files (exact-match semantics)
+- [ ] Can search code
+- [ ] <950 production lines
+- [ ] Streaming responses visible to user in real-time
 
 ---
 

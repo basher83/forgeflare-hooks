@@ -1,6 +1,6 @@
 # Tool Name Compliance Specification
 
-**Status:** Complete
+**Status:** Active
 **Target:** Rename forgeflare's tool names to match Claude Code conventions for OAuth proxy compatibility
 
 ---
@@ -91,12 +91,12 @@ Internal function names (`read_exec`, `list_exec`, `bash_exec`, `edit_exec`, `se
 
 ## Success Criteria
 
-- [x] `cargo test` passes with all tool names updated (156 tests, v0.0.48)
-- [x] `cargo clippy -- -D warnings` clean
-- [x] `all_tool_schemas()` returns schemas with names `Read`, `Glob`, `Bash`, `Edit`, `Grep`
-- [x] Requests through OAuth proxy with tools succeed (`Glob({})` and `Read` verified on tailnet)
-- [x] Direct API key mode continues to work (tool names are valid regardless of auth method)
-- [x] System prompt tool guidance references new names
+- [ ] `cargo test` passes with all tool names updated
+- [ ] `cargo clippy -- -D warnings` clean
+- [ ] `all_tool_schemas()` returns schemas with names `Read`, `Glob`, `Bash`, `Edit`, `Grep`
+- [ ] Requests through OAuth proxy with tools succeed
+- [ ] Direct API key mode continues to work (tool names are valid regardless of auth method)
+- [ ] System prompt tool guidance references new names
 
 ---
 

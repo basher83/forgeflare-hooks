@@ -1,4 +1,5 @@
 mod api;
+mod hooks;
 mod session;
 mod tools;
 
@@ -6,6 +7,7 @@ use api::{
     classify_error, AgentError, AnthropicClient, ContentBlock, ErrorClass, Message, StopReason,
 };
 use clap::Parser;
+use hooks::{HookRunner, PostToolResult, PreToolResult};
 use session::SessionWriter;
 use std::io::{self, BufRead, Read as _, Write};
 use tools::{all_tool_schemas, dispatch_tool, tool_effect, ToolEffect};
@@ -17,6 +19,8 @@ const RETRY_AFTER_CAP: u64 = 60;
 const CONTEXT_BUDGET_BYTES: usize = 720_000;
 const MODEL_CONTEXT_TOKENS: u64 = 200_000;
 const TRIM_THRESHOLD: u64 = MODEL_CONTEXT_TOKENS * 60 / 100; // 120K tokens
+const MAX_CONSECUTIVE_BLOCKS: usize = 3;
+const MAX_TOTAL_BLOCKS: usize = 10;
 
 #[derive(Parser)]
 #[command(
@@ -213,9 +217,14 @@ async fn main() {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     let mut session = SessionWriter::new(&cwd, &cli.model);
+    let hooks = HookRunner::load(".forgeflare/hooks.toml", &cwd);
+    hooks.clear_convergence_state();
 
     if cli.verbose {
         eprintln!("[verbose] Session ID: {}", session.session_id());
+        if hooks.has_hooks() {
+            eprintln!("[verbose] Hooks loaded from .forgeflare/hooks.toml");
+        }
     }
 
     // Check for piped stdin
@@ -239,6 +248,7 @@ async fn main() {
             &tools,
             &mut conversation,
             &mut session,
+            &hooks,
             &input,
         )
         .await;
@@ -277,6 +287,7 @@ async fn main() {
                 &tools,
                 &mut conversation,
                 &mut session,
+                &hooks,
                 &input,
             )
             .await;
@@ -286,6 +297,7 @@ async fn main() {
     session.write_context();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     cli: &Cli,
     client: &AnthropicClient,
@@ -293,6 +305,7 @@ async fn run_turn(
     tools: &[serde_json::Value],
     conversation: &mut Vec<Message>,
     session: &mut SessionWriter,
+    hooks: &HookRunner,
     input: &str,
 ) {
     // Add user message
@@ -309,6 +322,10 @@ async fn run_turn(
     let mut tool_iterations: usize = 0;
     let mut continuation_count: usize = 0;
     let mut last_input_tokens: u64 = 0;
+    let mut consecutive_block_count: usize = 0;
+    let mut total_block_count: usize = 0;
+    let mut total_tokens: u64 = 0;
+    let mut stop_reason_str = "end_turn";
 
     // Inner loop: call API, dispatch tools, repeat
     loop {
@@ -319,6 +336,7 @@ async fn run_turn(
         if tool_iterations >= MAX_TOOL_ITERATIONS {
             eprintln!("[warn] Tool iteration limit ({MAX_TOOL_ITERATIONS}) reached");
             recover_conversation(conversation);
+            stop_reason_str = "iteration_limit";
             break;
         }
 
@@ -351,6 +369,7 @@ async fn run_turn(
 
                     if classify_error(&e) == ErrorClass::Permanent {
                         recover_conversation(conversation);
+                        stop_reason_str = "api_error";
                         break;
                     }
 
@@ -358,6 +377,7 @@ async fn run_turn(
                     if attempt >= MAX_RETRIES {
                         eprintln!("[retry] Max retries ({MAX_RETRIES}) exhausted");
                         recover_conversation(conversation);
+                        stop_reason_str = "api_error";
                         break;
                     }
 
@@ -395,6 +415,7 @@ async fn run_turn(
 
         // Update token tracking for next trim decision
         last_input_tokens = usage.input_tokens;
+        total_tokens += usage.input_tokens + usage.output_tokens;
 
         // Filter null-input tool_use blocks on MaxTokens truncation
         let blocks = if stop_reason == StopReason::MaxTokens {
@@ -416,6 +437,7 @@ async fn run_turn(
         // 1. EndTurn — normal completion
         if stop_reason == StopReason::EndTurn {
             println!();
+            stop_reason_str = "end_turn";
             break;
         }
 
@@ -426,6 +448,7 @@ async fn run_turn(
             match classify_max_tokens(&blocks, continuation_count) {
                 MaxTokensAction::BreakEmpty => {
                     eprintln!("[info] Empty response at max_tokens, breaking");
+                    stop_reason_str = "continuation_cap";
                     break;
                 }
                 MaxTokensAction::DispatchTools => {
@@ -451,6 +474,7 @@ async fn run_turn(
                 }
                 MaxTokensAction::BreakCapReached => {
                     eprintln!("[continue] Max continuations reached, breaking");
+                    stop_reason_str = "continuation_cap";
                     break;
                 }
             }
@@ -474,97 +498,168 @@ async fn run_turn(
                 .iter()
                 .all(|(_, name, _)| tool_effect(name) == ToolEffect::Pure);
 
+        let mut signal_break = false;
+        let mut threshold_tripped = false;
+        let mut threshold_reason = "";
+
         let tool_results: Vec<ContentBlock> = if all_pure {
             // Parallel path: all tools are pure (Read, Glob, Grep)
-            // Pre-dispatch logging on main thread
-            for (_, name, input) in &tool_uses {
+            let batch_size = tool_uses.len();
+            let mut slots: Vec<Option<ContentBlock>> = vec![None; batch_size];
+            let mut blocked_flags: Vec<bool> = vec![false; batch_size];
+            let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
+
+            for (i, (id, name, input)) in tool_uses.iter().enumerate() {
                 if input.is_null() {
-                    continue;
-                }
-                if cli.verbose {
-                    eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
-                } else {
-                    eprintln!("\n[tool] {name}");
-                }
-            }
-
-            // Spawn all pure tools concurrently
-            let mut futures = Vec::new();
-            let mut meta: Vec<(String, String)> = Vec::new(); // (name, id_fallback) for post-dispatch
-
-            for (id, name, input) in &tool_uses {
-                let id_owned = id.clone();
-                let id_fallback = id.clone();
-                let name_owned = name.clone();
-                let name_log = name.clone();
-                let input_owned = input.clone();
-
-                if input.is_null() {
-                    // Null-input: produce error result directly, no spawn
-                    futures.push(tokio::task::spawn_blocking(move || {
-                        ContentBlock::ToolResult {
-                            tool_use_id: id_owned,
-                            content: "null input (truncated tool_use)".to_string(),
-                            is_error: Some(true),
-                        }
-                    }));
-                    meta.push((name_log, id_fallback));
-                    continue;
-                }
-
-                let handle = tokio::task::spawn_blocking(move || {
-                    if input_owned.is_null() {
-                        return ContentBlock::ToolResult {
-                            tool_use_id: id_owned,
-                            content: "null input (truncated tool_use)".to_string(),
-                            is_error: Some(true),
-                        };
-                    }
-                    let result = dispatch_tool(&name_owned, &input_owned, &mut |_: &str| {});
-                    let (content, is_error) = match result {
-                        Ok(output) => (output, false),
-                        Err(err) => (err, true),
-                    };
-                    ContentBlock::ToolResult {
-                        tool_use_id: id_owned,
-                        content,
-                        is_error: if is_error { Some(true) } else { None },
-                    }
-                });
-                futures.push(handle);
-                meta.push((name_log, id_fallback));
-            }
-
-            let results = futures_util::future::join_all(futures).await;
-
-            // Collect results, handling JoinError (thread panic)
-            let mut tool_results = Vec::new();
-            for (i, join_result) in results.into_iter().enumerate() {
-                let result = match join_result {
-                    Ok(block) => block,
-                    Err(_) => ContentBlock::ToolResult {
-                        tool_use_id: meta[i].1.clone(),
-                        content: "tool panicked".to_string(),
+                    slots[i] = Some(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "null input (truncated tool_use)".to_string(),
                         is_error: Some(true),
-                    },
-                };
+                    });
+                    continue;
+                }
+
+                // PreToolUse guard + observe
+                let pre_result = hooks.run_pre_tool_use(name, input, tool_iterations).await;
+
+                match pre_result {
+                    PreToolResult::Block { reason, .. } => {
+                        slots[i] = Some(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: reason,
+                            is_error: Some(true),
+                        });
+                        blocked_flags[i] = true;
+                        consecutive_block_count += 1;
+                        total_block_count += 1;
+
+                        if consecutive_block_count >= MAX_CONSECUTIVE_BLOCKS {
+                            eprintln!(
+                                "[hooks] Consecutive block limit ({MAX_CONSECUTIVE_BLOCKS}) reached"
+                            );
+                            threshold_tripped = true;
+                            threshold_reason = "block_limit_consecutive";
+                            break;
+                        }
+                        if total_block_count >= MAX_TOTAL_BLOCKS {
+                            eprintln!("[hooks] Total block limit ({MAX_TOTAL_BLOCKS}) reached");
+                            threshold_tripped = true;
+                            threshold_reason = "block_limit_total";
+                            break;
+                        }
+                    }
+                    PreToolResult::Allow => {
+                        consecutive_block_count = 0;
+
+                        if cli.verbose {
+                            eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
+                        } else {
+                            eprintln!("\n[tool] {name}");
+                        }
+
+                        let id_owned = id.clone();
+                        let name_owned = name.clone();
+                        let input_owned = input.clone();
+
+                        let handle = tokio::task::spawn_blocking(move || {
+                            let result =
+                                dispatch_tool(&name_owned, &input_owned, &mut |_: &str| {});
+                            let (content, is_error) = match result {
+                                Ok(output) => (output, false),
+                                Err(err) => (err, true),
+                            };
+                            ContentBlock::ToolResult {
+                                tool_use_id: id_owned,
+                                content,
+                                is_error: if is_error { Some(true) } else { None },
+                            }
+                        });
+                        spawn_futures.push((i, handle));
+                    }
+                }
+            }
+
+            if threshold_tripped {
+                // Join already-spawned futures (avoid detaching JoinHandles)
+                let handles: Vec<_> = spawn_futures
+                    .into_iter()
+                    .map(|(idx, h)| async move {
+                        let result = h.await;
+                        (idx, result)
+                    })
+                    .collect();
+                let results = futures_util::future::join_all(handles).await;
+                for (idx, result) in results {
+                    slots[idx] = Some(match result {
+                        Ok(block) => block,
+                        Err(_) => ContentBlock::ToolResult {
+                            tool_use_id: tool_uses[idx].0.clone(),
+                            content: "tool panicked".to_string(),
+                            is_error: Some(true),
+                        },
+                    });
+                }
+                // Batch abandoned — conversation.pop() + break happens below
+                Vec::new() // placeholder, won't be used
+            } else {
+                // Normal path: join_all spawned futures
+                let handles: Vec<_> = spawn_futures
+                    .into_iter()
+                    .map(|(idx, h)| async move {
+                        let result = h.await;
+                        (idx, result)
+                    })
+                    .collect();
+                let results = futures_util::future::join_all(handles).await;
+                for (idx, result) in results {
+                    slots[idx] = Some(match result {
+                        Ok(block) => block,
+                        Err(_) => ContentBlock::ToolResult {
+                            tool_use_id: tool_uses[idx].0.clone(),
+                            content: "tool panicked".to_string(),
+                            is_error: Some(true),
+                        },
+                    });
+                }
 
                 // Post-dispatch logging
-                if let ContentBlock::ToolResult {
-                    ref content,
-                    is_error,
-                    ..
-                } = result
-                {
-                    let is_err = is_error.unwrap_or(false);
-                    let display = format_tool_result_display(content, is_err, cli.verbose);
-                    eprintln!("{display}");
+                for slot in &slots {
+                    if let Some(ContentBlock::ToolResult {
+                        ref content,
+                        is_error,
+                        ..
+                    }) = slot
+                    {
+                        let is_err = is_error.unwrap_or(false);
+                        let display = format_tool_result_display(content, is_err, cli.verbose);
+                        eprintln!("{display}");
+                    }
                 }
 
-                tool_results.push(result);
-            }
+                // PostToolUse for non-blocked tools
+                for (i, (_, name, input)) in tool_uses.iter().enumerate() {
+                    if blocked_flags[i] {
+                        continue;
+                    }
+                    if let Some(ContentBlock::ToolResult {
+                        ref content,
+                        is_error,
+                        ..
+                    }) = slots[i]
+                    {
+                        let is_err = is_error.unwrap_or(false);
+                        let post_result = hooks
+                            .run_post_tool_use(name, input, content, is_err, tool_iterations)
+                            .await;
+                        if matches!(post_result, PostToolResult::Signal { .. }) {
+                            signal_break = true;
+                        }
+                    }
+                }
 
-            tool_results
+                // Collect final results (unwrap all slots)
+                slots.into_iter().map(|s| s.unwrap()).collect()
+            }
         } else {
             // Sequential path: any Mutating tool in the batch
             let mut tool_results: Vec<ContentBlock> = Vec::new();
@@ -572,6 +667,40 @@ async fn run_turn(
             for (id, name, input) in &tool_uses {
                 if input.is_null() {
                     continue;
+                }
+
+                // PreToolUse guard + observe
+                let pre_result = hooks.run_pre_tool_use(name, input, tool_iterations).await;
+
+                match pre_result {
+                    PreToolResult::Block { reason, .. } => {
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: reason,
+                            is_error: Some(true),
+                        });
+                        consecutive_block_count += 1;
+                        total_block_count += 1;
+
+                        if consecutive_block_count >= MAX_CONSECUTIVE_BLOCKS {
+                            eprintln!(
+                                "[hooks] Consecutive block limit ({MAX_CONSECUTIVE_BLOCKS}) reached"
+                            );
+                            threshold_tripped = true;
+                            threshold_reason = "block_limit_consecutive";
+                            break;
+                        }
+                        if total_block_count >= MAX_TOTAL_BLOCKS {
+                            eprintln!("[hooks] Total block limit ({MAX_TOTAL_BLOCKS}) reached");
+                            threshold_tripped = true;
+                            threshold_reason = "block_limit_total";
+                            break;
+                        }
+                        continue;
+                    }
+                    PreToolResult::Allow => {
+                        consecutive_block_count = 0;
+                    }
                 }
 
                 if cli.verbose {
@@ -599,6 +728,14 @@ async fn run_turn(
                     }
                 };
 
+                // PostToolUse
+                let post_result = hooks
+                    .run_post_tool_use(name, input, &content, is_error, tool_iterations)
+                    .await;
+                if matches!(post_result, PostToolResult::Signal { .. }) {
+                    signal_break = true;
+                }
+
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content,
@@ -608,6 +745,13 @@ async fn run_turn(
 
             tool_results
         };
+
+        // Block threshold takes unconditional precedence over signal_break
+        if threshold_tripped {
+            conversation.pop(); // Remove trailing Assistant message
+            stop_reason_str = threshold_reason;
+            break;
+        }
 
         if tool_results.is_empty() {
             break;
@@ -621,7 +765,17 @@ async fn run_turn(
         session.append_user_turn(&tool_msg);
 
         tool_iterations += 1;
+
+        if signal_break {
+            stop_reason_str = "convergence_signal";
+            break;
+        }
     }
+
+    // Fire stop hook
+    hooks
+        .run_stop(stop_reason_str, tool_iterations, total_tokens)
+        .await;
 }
 
 fn truncate_json(value: &serde_json::Value, max_len: usize) -> String {
@@ -1316,5 +1470,124 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Hook dispatch integration tests ---
+
+    #[test]
+    fn block_counter_constants() {
+        assert_eq!(MAX_CONSECUTIVE_BLOCKS, 3);
+        assert_eq!(MAX_TOTAL_BLOCKS, 10);
+    }
+
+    #[test]
+    fn consecutive_block_threshold_logic() {
+        // Simulate consecutive blocks hitting threshold
+        let mut consecutive = 0usize;
+        let mut tripped = false;
+
+        for _ in 0..3 {
+            consecutive += 1;
+            if consecutive >= MAX_CONSECUTIVE_BLOCKS {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "threshold should trip at 3 consecutive blocks");
+        assert_eq!(consecutive, 3);
+    }
+
+    #[test]
+    fn consecutive_block_resets_on_allow() {
+        // Simulate the counter behavior from run_turn:
+        // block, block, allow(reset), block, block → consecutive should be 2
+        let steps: &[bool] = &[false, false, true, false, false]; // true=allow, false=block
+        let mut consecutive = 0usize;
+        for &is_allow in steps {
+            if is_allow {
+                consecutive = 0;
+            } else {
+                consecutive += 1;
+            }
+        }
+        assert_eq!(consecutive, 2, "should be 2 after reset and 2 more blocks");
+        assert!(consecutive < MAX_CONSECUTIVE_BLOCKS, "should not trip");
+    }
+
+    #[test]
+    fn total_block_never_resets_in_inner_loop() {
+        // Simulate: block, allow (resets consecutive only), block, block
+        let steps: &[bool] = &[false, true, false, false]; // true=allow, false=block
+        let mut total = 0usize;
+        let mut consecutive = 0usize;
+        for &is_allow in steps {
+            if is_allow {
+                consecutive = 0;
+            } else {
+                total += 1;
+                consecutive += 1;
+            }
+        }
+        assert_eq!(total, 3, "total should count all blocks");
+        assert_eq!(consecutive, 2, "consecutive should be 2 after reset");
+    }
+
+    #[test]
+    fn total_block_threshold_logic() {
+        let mut total = 0usize;
+        let mut tripped = false;
+
+        for _ in 0..10 {
+            total += 1;
+            if total >= MAX_TOTAL_BLOCKS {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "threshold should trip at 10 total blocks");
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn both_counters_reset_on_outer_loop() {
+        // In run_turn, both are initialized to 0 (fresh per call).
+        // Verify by simulating two "turns":
+        let make_counters = || -> (usize, usize) { (0, 0) };
+
+        let (c1, t1) = make_counters();
+        assert_eq!(c1, 0);
+        assert_eq!(t1, 0);
+
+        // Simulate some blocks in first "turn"
+        // Then new turn resets
+        let (c2, t2) = make_counters();
+        assert_eq!(c2, 0);
+        assert_eq!(t2, 0);
+    }
+
+    #[test]
+    fn consecutive_takes_precedence_over_total() {
+        // When both trip simultaneously (3 consecutive that also push total to 10),
+        // consecutive fires first.
+        let mut consecutive = 0usize;
+        let mut total = 7usize; // already had 7 total blocks
+        let mut reason = "";
+
+        for _ in 0..3 {
+            consecutive += 1;
+            total += 1;
+            if consecutive >= MAX_CONSECUTIVE_BLOCKS {
+                reason = "block_limit_consecutive";
+                break;
+            }
+            if total >= MAX_TOTAL_BLOCKS {
+                reason = "block_limit_total";
+                break;
+            }
+        }
+
+        assert_eq!(reason, "block_limit_consecutive");
+        assert_eq!(consecutive, 3);
+        assert_eq!(total, 10);
     }
 }

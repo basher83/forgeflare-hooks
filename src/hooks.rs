@@ -40,7 +40,7 @@ pub enum PostToolResult {
 struct ConvergenceState {
     #[serde(default)]
     observations: Vec<Observation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "final", skip_serializing_if = "Option::is_none")]
     final_state: Option<FinalState>,
 }
 
@@ -1296,6 +1296,17 @@ timeout_ms = 5000
         .unwrap();
 
         let content = fs::read_to_string(&conv_path).unwrap();
+
+        // Verify raw JSON uses "final" key (not "final_state") per spec
+        assert!(
+            content.contains("\"final\""),
+            "convergence JSON must use \"final\" key per hooks.md spec"
+        );
+        assert!(
+            !content.contains("\"final_state\""),
+            "convergence JSON must not use \"final_state\" key"
+        );
+
         let state: ConvergenceState = serde_json::from_str(&content).unwrap();
         assert!(state.final_state.is_some());
         let final_s = state.final_state.unwrap();

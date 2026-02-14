@@ -2,7 +2,7 @@
 
 All 9 items complete. 119 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names.
 
-Updated 2026-02-14: Item 9 (release workflow) implemented. All specs fully implemented.
+Updated 2026-02-14: Fixed convergence JSON key from "final_state" to "final" per hooks.md spec (serde rename was missing). Added regression test asserting raw JSON key name.
 
 ## Completed Items
 
@@ -44,7 +44,7 @@ Updated 2026-02-14: Item 9 (release workflow) implemented. All specs fully imple
 - Batch classification extracts (id, name, input) tuples before the parallel/sequential branch to avoid borrowing blocks inside both paths
 - HookRunner stores absolute convergence paths (dir, path, tmp) to avoid test parallelism issues with set_current_dir — tests that change cwd race with parallel tests
 - write_observations and write_final_state take explicit Path parameters rather than using constants — enables isolated temp-dir testing
-- Convergence state uses a custom ConvergenceState struct with serde for read-modify-write; the `final` JSON key is mapped to `final_state` (Rust reserved word)
+- Convergence state uses a custom ConvergenceState struct with serde for read-modify-write; the `final` JSON key is mapped to `final_state` (Rust reserved word) via `#[serde(rename = "final")]`
 - tokio::process::Command needs explicit stdin close (drop after write_all) for hooks to receive EOF and produce output
 - Hook subprocess execution wraps spawn-write-read in tokio::time::timeout — the timeout covers the entire sequence, not just individual operations
 - Release workflow uses inline CI validation per matrix leg rather than a separate CI job dependency — simpler and avoids cross-workflow triggers

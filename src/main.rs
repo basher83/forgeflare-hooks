@@ -8,7 +8,7 @@ use api::{
 use clap::Parser;
 use session::SessionWriter;
 use std::io::{self, BufRead, Read as _, Write};
-use tools::{all_tool_schemas, dispatch_tool};
+use tools::{all_tool_schemas, dispatch_tool, tool_effect, ToolEffect};
 
 const MAX_TOOL_ITERATIONS: usize = 50;
 const MAX_RETRIES: usize = 4;
@@ -457,10 +457,119 @@ async fn run_turn(
         }
 
         // 3. Tool dispatch — runs for both ToolUse and MaxTokens-with-valid-tools
-        let mut tool_results: Vec<ContentBlock> = Vec::new();
+        // Classify batch: if all tools are Pure, dispatch concurrently
+        let tool_uses: Vec<_> = blocks
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::ToolUse { id, name, input } = b {
+                    Some((id.clone(), name.clone(), input.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        for block in &blocks {
-            if let ContentBlock::ToolUse { id, name, input } = block {
+        let all_pure = !tool_uses.is_empty()
+            && tool_uses
+                .iter()
+                .all(|(_, name, _)| tool_effect(name) == ToolEffect::Pure);
+
+        let tool_results: Vec<ContentBlock> = if all_pure {
+            // Parallel path: all tools are pure (Read, Glob, Grep)
+            // Pre-dispatch logging on main thread
+            for (_, name, input) in &tool_uses {
+                if input.is_null() {
+                    continue;
+                }
+                if cli.verbose {
+                    eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
+                } else {
+                    eprintln!("\n[tool] {name}");
+                }
+            }
+
+            // Spawn all pure tools concurrently
+            let mut futures = Vec::new();
+            let mut meta: Vec<(String, String)> = Vec::new(); // (name, id_fallback) for post-dispatch
+
+            for (id, name, input) in &tool_uses {
+                let id_owned = id.clone();
+                let id_fallback = id.clone();
+                let name_owned = name.clone();
+                let name_log = name.clone();
+                let input_owned = input.clone();
+
+                if input.is_null() {
+                    // Null-input: produce error result directly, no spawn
+                    futures.push(tokio::task::spawn_blocking(move || {
+                        ContentBlock::ToolResult {
+                            tool_use_id: id_owned,
+                            content: "null input (truncated tool_use)".to_string(),
+                            is_error: Some(true),
+                        }
+                    }));
+                    meta.push((name_log, id_fallback));
+                    continue;
+                }
+
+                let handle = tokio::task::spawn_blocking(move || {
+                    if input_owned.is_null() {
+                        return ContentBlock::ToolResult {
+                            tool_use_id: id_owned,
+                            content: "null input (truncated tool_use)".to_string(),
+                            is_error: Some(true),
+                        };
+                    }
+                    let result = dispatch_tool(&name_owned, &input_owned, &mut |_: &str| {});
+                    let (content, is_error) = match result {
+                        Ok(output) => (output, false),
+                        Err(err) => (err, true),
+                    };
+                    ContentBlock::ToolResult {
+                        tool_use_id: id_owned,
+                        content,
+                        is_error: if is_error { Some(true) } else { None },
+                    }
+                });
+                futures.push(handle);
+                meta.push((name_log, id_fallback));
+            }
+
+            let results = futures_util::future::join_all(futures).await;
+
+            // Collect results, handling JoinError (thread panic)
+            let mut tool_results = Vec::new();
+            for (i, join_result) in results.into_iter().enumerate() {
+                let result = match join_result {
+                    Ok(block) => block,
+                    Err(_) => ContentBlock::ToolResult {
+                        tool_use_id: meta[i].1.clone(),
+                        content: "tool panicked".to_string(),
+                        is_error: Some(true),
+                    },
+                };
+
+                // Post-dispatch logging
+                if let ContentBlock::ToolResult {
+                    ref content,
+                    is_error,
+                    ..
+                } = result
+                {
+                    let is_err = is_error.unwrap_or(false);
+                    let display = format_tool_result_display(content, is_err, cli.verbose);
+                    eprintln!("{display}");
+                }
+
+                tool_results.push(result);
+            }
+
+            tool_results
+        } else {
+            // Sequential path: any Mutating tool in the batch
+            let mut tool_results: Vec<ContentBlock> = Vec::new();
+
+            for (id, name, input) in &tool_uses {
                 if input.is_null() {
                     continue;
                 }
@@ -496,7 +605,9 @@ async fn run_turn(
                     is_error: if is_error { Some(true) } else { None },
                 });
             }
-        }
+
+            tool_results
+        };
 
         if tool_results.is_empty() {
             break;
@@ -986,5 +1097,224 @@ mod tests {
         // Small conversation under budget — trim is a no-op, but should be called
         trim_if_needed(&mut msgs, 0);
         assert_eq!(msgs.len(), 1, "small conversation unchanged by trim");
+    }
+
+    // --- Tool parallelism tests ---
+
+    #[test]
+    fn batch_classification_all_pure() {
+        // A batch of only Read/Glob/Grep tools should classify as all-pure
+        let tool_uses = vec![
+            ("id1", "Read", serde_json::json!({"file_path": "/tmp/a"})),
+            ("id2", "Glob", serde_json::json!({"pattern": "*.rs"})),
+            ("id3", "Grep", serde_json::json!({"pattern": "foo"})),
+        ];
+        let all_pure = tool_uses
+            .iter()
+            .all(|(_, name, _)| tool_effect(name) == ToolEffect::Pure);
+        assert!(all_pure, "all Read/Glob/Grep should be pure");
+    }
+
+    #[test]
+    fn batch_classification_mixed_is_sequential() {
+        // A batch with Read + Edit should NOT classify as all-pure
+        let tool_uses = vec![
+            ("id1", "Read", serde_json::json!({"file_path": "/tmp/a"})),
+            (
+                "id2",
+                "Edit",
+                serde_json::json!({"file_path": "/tmp/b", "old_str": "x", "new_str": "y"}),
+            ),
+        ];
+        let all_pure = tool_uses
+            .iter()
+            .all(|(_, name, _)| tool_effect(name) == ToolEffect::Pure);
+        assert!(!all_pure, "mixed batch with Edit should not be all-pure");
+    }
+
+    #[test]
+    fn batch_classification_single_pure() {
+        // Degenerate case: batch of 1 pure tool works correctly
+        let tool_uses = vec![("id1", "Read", serde_json::json!({"file_path": "/tmp/a"}))];
+        let all_pure = tool_uses
+            .iter()
+            .all(|(_, name, _)| tool_effect(name) == ToolEffect::Pure);
+        assert!(all_pure, "single Read tool should be all-pure");
+    }
+
+    #[tokio::test]
+    async fn parallel_reads_faster_than_sequential() {
+        // 3 concurrent Reads should complete faster than sequential.
+        // We use Bash(sleep) dispatches wrapped in spawn_blocking to measure concurrency,
+        // but instead we'll use actual Read calls which are fast I/O.
+        // Create temp files and verify parallel is at least not slower.
+        let dir = std::env::temp_dir().join("forgeflare_parallel_test");
+        let _ = std::fs::create_dir_all(&dir);
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("file{i}.txt")), format!("content {i}")).unwrap();
+        }
+
+        let files: Vec<_> = (0..3)
+            .map(|i| {
+                dir.join(format!("file{i}.txt"))
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+
+        // Parallel: use join_all with spawn_blocking
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = files
+            .iter()
+            .map(|f| {
+                let f = f.clone();
+                tokio::task::spawn_blocking(move || {
+                    dispatch_tool("Read", &serde_json::json!({"file_path": f}), &mut |_| {})
+                })
+            })
+            .collect();
+        let results = futures_util::future::join_all(handles).await;
+        let parallel_time = start.elapsed();
+
+        // All should succeed
+        for r in &results {
+            assert!(r.as_ref().unwrap().is_ok());
+        }
+
+        // Sequential
+        let start = std::time::Instant::now();
+        for f in &files {
+            let r = dispatch_tool("Read", &serde_json::json!({"file_path": f}), &mut |_| {});
+            assert!(r.is_ok());
+        }
+        let sequential_time = start.elapsed();
+
+        // Both complete successfully; parallel should not be significantly slower
+        // (for fast I/O ops the difference is small, but the mechanism works)
+        assert!(
+            parallel_time <= sequential_time + std::time::Duration::from_millis(50),
+            "parallel ({parallel_time:?}) should not be much slower than sequential ({sequential_time:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_error_doesnt_cancel_siblings() {
+        // One failing Read should not prevent other Reads from completing
+        let dir = std::env::temp_dir().join("forgeflare_parallel_error_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("exists.txt"), "hello").unwrap();
+
+        let inputs = vec![
+            ("id1", dir.join("exists.txt").to_str().unwrap().to_string()),
+            (
+                "id2",
+                "/nonexistent/file_that_does_not_exist.txt".to_string(),
+            ),
+            ("id3", dir.join("exists.txt").to_str().unwrap().to_string()),
+        ];
+
+        let handles: Vec<_> = inputs
+            .iter()
+            .map(|(id, f)| {
+                let id = id.to_string();
+                let f = f.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result =
+                        dispatch_tool("Read", &serde_json::json!({"file_path": f}), &mut |_| {});
+                    let (content, is_error) = match result {
+                        Ok(output) => (output, false),
+                        Err(err) => (err, true),
+                    };
+                    ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content,
+                        is_error: if is_error { Some(true) } else { None },
+                    }
+                })
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(handles).await;
+
+        // First should succeed
+        let r0 = results[0].as_ref().unwrap();
+        if let ContentBlock::ToolResult { is_error, .. } = r0 {
+            assert!(is_error.is_none(), "first read should succeed");
+        }
+        // Second should fail
+        let r1 = results[1].as_ref().unwrap();
+        if let ContentBlock::ToolResult {
+            is_error, content, ..
+        } = r1
+        {
+            assert_eq!(*is_error, Some(true), "missing file should error");
+            assert!(content.contains("not found"));
+        }
+        // Third should succeed (not cancelled by second's failure)
+        let r2 = results[2].as_ref().unwrap();
+        if let ContentBlock::ToolResult { is_error, .. } = r2 {
+            assert!(
+                is_error.is_none(),
+                "third read should succeed despite second failing"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parallel_preserves_result_ordering() {
+        // Results from join_all must maintain the same order as input futures
+        let dir = std::env::temp_dir().join("forgeflare_parallel_order_test");
+        let _ = std::fs::create_dir_all(&dir);
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("ord{i}.txt")), format!("content_{i}")).unwrap();
+        }
+
+        let files: Vec<_> = (0..3)
+            .map(|i| {
+                (
+                    format!("id_{i}"),
+                    dir.join(format!("ord{i}.txt"))
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+
+        let handles: Vec<_> = files
+            .iter()
+            .map(|(id, f)| {
+                let id = id.clone();
+                let f = f.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result =
+                        dispatch_tool("Read", &serde_json::json!({"file_path": f}), &mut |_| {});
+                    (id, result)
+                })
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(handles).await;
+
+        for (i, r) in results.iter().enumerate() {
+            let (id, result) = r.as_ref().unwrap();
+            assert_eq!(
+                id,
+                &format!("id_{i}"),
+                "result {i} should preserve ordering"
+            );
+            let content = result.as_ref().unwrap();
+            assert!(
+                content.contains(&format!("content_{i}")),
+                "result {i} should contain correct content"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

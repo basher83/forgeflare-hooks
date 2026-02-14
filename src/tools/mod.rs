@@ -117,6 +117,20 @@ tools! {
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ToolEffect {
+    Pure,
+    Mutating,
+}
+
+pub fn tool_effect(name: &str) -> ToolEffect {
+    match name {
+        "Read" | "Glob" | "Grep" => ToolEffect::Pure,
+        "Bash" | "Edit" => ToolEffect::Mutating,
+        _ => ToolEffect::Mutating,
+    }
+}
+
 /// Dispatch a tool call by name. Returns Ok(output) or Err(error_message).
 /// Bash gets a streaming callback; other tools don't need one.
 pub fn dispatch_tool(
@@ -683,5 +697,46 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().contains("No matches"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- ToolEffect classification tests ---
+
+    #[test]
+    fn tool_effect_pure_tools() {
+        assert_eq!(tool_effect("Read"), ToolEffect::Pure);
+        assert_eq!(tool_effect("Glob"), ToolEffect::Pure);
+        assert_eq!(tool_effect("Grep"), ToolEffect::Pure);
+    }
+
+    #[test]
+    fn tool_effect_mutating_tools() {
+        assert_eq!(tool_effect("Bash"), ToolEffect::Mutating);
+        assert_eq!(tool_effect("Edit"), ToolEffect::Mutating);
+    }
+
+    #[test]
+    fn tool_effect_unknown_defaults_to_mutating() {
+        assert_eq!(tool_effect("Unknown"), ToolEffect::Mutating);
+        assert_eq!(tool_effect("FutureTool"), ToolEffect::Mutating);
+        assert_eq!(tool_effect(""), ToolEffect::Mutating);
+    }
+
+    #[test]
+    fn tool_effect_exhaustive_for_all_tools() {
+        let schemas = all_tool_schemas();
+        for schema in &schemas {
+            let name = schema["name"].as_str().unwrap();
+            let effect = tool_effect(name);
+            // Every known tool must have an explicit classification (not fall through to unknown)
+            match name {
+                "Read" | "Glob" | "Grep" => {
+                    assert_eq!(effect, ToolEffect::Pure, "{name} should be Pure")
+                }
+                "Bash" | "Edit" => {
+                    assert_eq!(effect, ToolEffect::Mutating, "{name} should be Mutating")
+                }
+                _ => panic!("New tool {name} needs explicit ToolEffect classification"),
+            }
+        }
     }
 }

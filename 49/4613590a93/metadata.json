@@ -3,8 +3,9 @@
   "checkpoint_id": "494613590a93",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
+    ".github/workflows/release.yml",
     "Cargo.toml",
     "IMPLEMENTATION_PLAN.md",
     "src/hooks.rs",
@@ -32,13 +33,20 @@
       "context": "/49/4613590a93/2/context.md",
       "content_hash": "/49/4613590a93/2/content_hash.txt",
       "prompt": "/49/4613590a93/2/prompt.txt"
+    },
+    {
+      "metadata": "/49/4613590a93/3/metadata.json",
+      "transcript": "/49/4613590a93/3/full.jsonl",
+      "context": "/49/4613590a93/3/context.md",
+      "content_hash": "/49/4613590a93/3/content_hash.txt",
+      "prompt": "/49/4613590a93/3/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 126,
-    "cache_creation_tokens": 313283,
-    "cache_read_tokens": 13256962,
-    "output_tokens": 1032,
-    "api_call_count": 123
+    "input_tokens": 154,
+    "cache_creation_tokens": 398712,
+    "cache_read_tokens": 15471535,
+    "output_tokens": 1227,
+    "api_call_count": 148
   }
 }

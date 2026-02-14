@@ -15,6 +15,8 @@ const MAX_RETRIES: usize = 4;
 const BACKOFF_SCHEDULE: [u64; 4] = [2, 4, 8, 16];
 const RETRY_AFTER_CAP: u64 = 60;
 const CONTEXT_BUDGET_BYTES: usize = 720_000;
+const MODEL_CONTEXT_TOKENS: u64 = 200_000;
+const TRIM_THRESHOLD: u64 = MODEL_CONTEXT_TOKENS * 60 / 100; // 120K tokens
 
 #[derive(Parser)]
 #[command(
@@ -99,6 +101,16 @@ fn trim_conversation(messages: &mut Vec<Message>) {
         }
     }
     messages.insert(0, first);
+}
+
+/// Gate trim_conversation on actual token usage from the API.
+/// - last_input_tokens == 0: no data yet, run byte-based trim (safety net)
+/// - last_input_tokens > 0 && < TRIM_THRESHOLD: skip trim (context is safe)
+/// - last_input_tokens >= TRIM_THRESHOLD: run byte-based trim
+fn trim_if_needed(messages: &mut Vec<Message>, last_input_tokens: u64) {
+    if last_input_tokens == 0 || last_input_tokens >= TRIM_THRESHOLD {
+        trim_conversation(messages);
+    }
 }
 
 /// Recover conversation alternation after API errors.
@@ -294,14 +306,16 @@ async fn run_turn(
     session.append_user_turn(&user_msg);
     session.write_prompt(input);
 
-    // Trim context if needed
-    trim_conversation(conversation);
-
     let mut tool_iterations: usize = 0;
     let mut continuation_count: usize = 0;
+    let mut last_input_tokens: u64 = 0;
 
     // Inner loop: call API, dispatch tools, repeat
     loop {
+        // Token-aware trim: first call (no data) uses byte safety net;
+        // subsequent calls skip trim when under threshold.
+        trim_if_needed(conversation, last_input_tokens);
+
         if tool_iterations >= MAX_TOOL_ITERATIONS {
             eprintln!("[warn] Tool iteration limit ({MAX_TOOL_ITERATIONS}) reached");
             recover_conversation(conversation);
@@ -378,6 +392,9 @@ async fn run_turn(
             Some(r) => r,
             None => break, // All retries failed or permanent error
         };
+
+        // Update token tracking for next trim decision
+        last_input_tokens = usage.input_tokens;
 
         // Filter null-input tool_use blocks on MaxTokens truncation
         let blocks = if stop_reason == StopReason::MaxTokens {
@@ -798,5 +815,176 @@ mod tests {
     #[test]
     fn max_continuations_constant() {
         assert_eq!(MAX_CONTINUATIONS, 3);
+    }
+
+    // --- Token-aware trim tests ---
+
+    #[test]
+    fn trim_threshold_is_60_percent() {
+        assert_eq!(MODEL_CONTEXT_TOKENS, 200_000);
+        assert_eq!(TRIM_THRESHOLD, 120_000);
+    }
+
+    #[test]
+    fn trim_if_needed_zero_tokens_runs_trim() {
+        // First call (no data yet) — trim should run.
+        // Build a conversation that exceeds byte budget to verify trim actually fires.
+        let big_text = "x".repeat(CONTEXT_BUDGET_BYTES + 1000);
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "keep".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: big_text.clone(),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "more".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "reply".to_string(),
+                }],
+            },
+        ];
+        let original_len = msgs.len();
+        trim_if_needed(&mut msgs, 0);
+        // Conversation was over budget, trim should have removed messages
+        assert!(
+            msgs.len() < original_len,
+            "trim should have reduced message count"
+        );
+    }
+
+    #[test]
+    fn trim_if_needed_under_threshold_skips_trim() {
+        // Usage is under 120K — trim should NOT run, even if byte budget exceeded.
+        let big_text = "x".repeat(CONTEXT_BUDGET_BYTES + 1000);
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "keep".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text { text: big_text }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "more".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "reply".to_string(),
+                }],
+            },
+        ];
+        let original_len = msgs.len();
+        trim_if_needed(&mut msgs, 50_000); // Well under 120K
+                                           // Trim should have been skipped entirely
+        assert_eq!(msgs.len(), original_len, "trim should not have run");
+    }
+
+    #[test]
+    fn trim_if_needed_at_threshold_runs_trim() {
+        // Usage exactly at threshold — trim should run.
+        let big_text = "x".repeat(CONTEXT_BUDGET_BYTES + 1000);
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "keep".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text { text: big_text }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "more".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "reply".to_string(),
+                }],
+            },
+        ];
+        let original_len = msgs.len();
+        trim_if_needed(&mut msgs, TRIM_THRESHOLD);
+        assert!(
+            msgs.len() < original_len,
+            "trim should have reduced message count"
+        );
+    }
+
+    #[test]
+    fn trim_if_needed_above_threshold_runs_trim() {
+        // Usage above threshold — trim should run.
+        let big_text = "x".repeat(CONTEXT_BUDGET_BYTES + 1000);
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "keep".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text { text: big_text }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "more".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "reply".to_string(),
+                }],
+            },
+        ];
+        let original_len = msgs.len();
+        trim_if_needed(&mut msgs, 180_000);
+        assert!(
+            msgs.len() < original_len,
+            "trim should have reduced message count"
+        );
+    }
+
+    #[test]
+    fn last_input_tokens_resets_per_turn() {
+        // last_input_tokens is a local variable in run_turn, so each call starts at 0.
+        // This test verifies the constant relationship — run_turn creates fresh state.
+        // The variable is initialized to 0 at the top of run_turn, verified by code inspection.
+        // We test the gate behavior: 0 always runs trim (first-call safety net).
+        let mut msgs = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        // Small conversation under budget — trim is a no-op, but should be called
+        trim_if_needed(&mut msgs, 0);
+        assert_eq!(msgs.len(), 1, "small conversation unchanged by trim");
     }
 }

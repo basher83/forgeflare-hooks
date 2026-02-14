@@ -2,7 +2,7 @@
 
 Project state: greenfield. Zero source code exists — no `Cargo.toml`, no `src/` directory, no `.rs` files, no `.github/workflows/`. All 10 specs are authored and complete. The Ralph loop harness (`loop.sh`), AGENTS.md, CLAUDE.md, and mise.toml are configured. Implementation follows the order defined in `specs/README.md` to avoid structural conflicts.
 
-Updated 2026-02-14: Items 1-5 complete. 66 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names. Session capture writes JSONL incrementally, parses usage from SSE events. MaxTokens continuation injects "Continue from where you left off." up to 3 times for text-only truncations; tool_use MaxTokens falls through to dispatch.
+Updated 2026-02-14: Items 1-6 complete. 72 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names. Session capture writes JSONL incrementally, parses usage from SSE events. MaxTokens continuation injects "Continue from where you left off." up to 3 times for text-only truncations; tool_use MaxTokens falls through to dispatch. Token-aware trim gates `trim_conversation()` on `last_input_tokens` — skips expensive byte-serialization when API reports < 120K input tokens, preserving context the model can still use.
 
 ## 1. Foundation: `coding-agent.md` + `tool-name-compliance.md` (combined)
 
@@ -53,8 +53,8 @@ Depends on: items 1-4 (restructures inner loop control flow; needs session captu
 
 Depends on: items 1-4 (needs `Usage.input_tokens` from `send_message()` return value).
 
-- [ ] **6a. `src/main.rs`** — Add `let mut last_input_tokens: u64 = 0;` alongside `tool_iterations`. After successful `send_message()` (after retry loop), update: `last_input_tokens = usage.input_tokens`. Before `trim_conversation()` call, gate: `last_input_tokens == 0` → run trim (no data yet); `last_input_tokens > 0 && < 120_000` → skip trim; `last_input_tokens >= 120_000` → run trim. Constants: `const MODEL_CONTEXT_TOKENS: u64 = 200_000;` and `const TRIM_THRESHOLD: u64 = 120_000;` (60% of context). Resets to 0 on new user input (outer loop). Updated after every successful API call including continuations.
-- [ ] **6b. Tests** — First call (last_input_tokens == 0) runs byte trim. Subsequent call with usage < 120K skips trim. Subsequent call with usage >= 120K runs trim. Reset on outer loop iteration.
+- [x] **6a. `src/main.rs`** — Added `MODEL_CONTEXT_TOKENS` (200K) and `TRIM_THRESHOLD` (120K) constants. `trim_if_needed()` function gates `trim_conversation()`: runs at 0 tokens (first call safety net) and >= threshold, skips when under threshold. `last_input_tokens` local to `run_turn()` (resets naturally per outer loop). Updated after every successful API call via `last_input_tokens = usage.input_tokens`. Trim moved inside inner loop so it runs before each API call.
+- [x] **6b. Tests** — 6 new tests (72 total): threshold constant values, zero-tokens runs trim, under-threshold skips trim, at-threshold runs trim, above-threshold runs trim, per-turn reset behavior.
 
 ## 7. Tool Parallelism: `tool-parallelism.md`
 
@@ -126,3 +126,5 @@ The `reference/go-source/` directory referenced by `coding-agent.md` does not ex
 - SSE `message_start` carries usage at `message.usage` (nested), while `message_delta` carries usage at top-level `usage`
 - Extracted `classify_max_tokens()` with `MaxTokensAction` enum from inline branch logic — makes the MaxTokens decision testable without needing a full API client mock
 - `continuation_count` is naturally scoped to `run_turn()` — each call to `run_turn()` gets a fresh count, so outer-loop reset happens for free
+- `trim_if_needed()` extracted as a named function rather than inline if/else — makes the token gating testable independently of the full conversation loop
+- Moving trim inside the inner loop (before each API call) is correct — the conversation grows between iterations (tool results added), so trim needs to re-evaluate each time

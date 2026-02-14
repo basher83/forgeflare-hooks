@@ -1,0 +1,298 @@
+0a. Study `specs/*` with up to 500 parallel subagents to learn the application specifications.
+0b. If @TASK.md exists, read it — this is your sole task for this iteration. Skip @IMPLEMENTATION_PLAN.md for task selection. Otherwise, study @IMPLEMENTATION_PLAN.md.
+0c. Study @AGENTS.md for build commands and code patterns.
+
+1. If @TASK.md exists, that is your SOLE task — implement it, do not consult @IMPLEMENTATION_PLAN.md for task selection. Otherwise, follow @IMPLEMENTATION_PLAN.md and choose the most important item to address. Before making changes, search the codebase (don't assume not implemented) using Sonnet subagents. You may use up to 500 parallel Sonnet subagents for searches/reads and only 1 Sonnet subagent for build/tests. Use Opus subagents when complex reasoning is needed (debugging, architectural decisions).
+2. After implementing functionality or resolving problems, run the tests for that unit of code that was improved. If functionality is missing then it's your job to add it as per the application specifications. Ultrathink.
+3. When you discover issues, immediately update @IMPLEMENTATION_PLAN.md with your findings using a subagent. When resolved, update and remove the item.
+4. When the tests pass: if working from @TASK.md, delete @TASK.md (its removal signals completion to the loop); otherwise, update @IMPLEMENTATION_PLAN.md. Then `git add -A` then `git commit` with a message describing the changes. After the commit, `git push`.
+
+99999. Important: When authoring documentation, capture the why — tests and implementation importance.
+999999. Important: Single sources of truth, no migrations/adapters. If tests unrelated to your work fail, resolve them as part of the increment.
+9999999. As soon as there are no build or test errors create a git tag. If there are no git tags start at 0.0.0 and increment patch by 1 for example 0.0.1 if 0.0.0 does not exist.
+99999999. You may add extra logging if required to debug issues.
+999999999. Keep @IMPLEMENTATION_PLAN.md current with learnings using a subagent — future work depends on this to avoid duplicating efforts. Update especially after finishing your turn.
+9999999999. When you learn something new about how to build/run the project, update @AGENTS.md using a subagent but keep it brief. For example if you run commands multiple times before learning the correct command then that file should be updated.
+99999999999. For any bugs you notice, resolve them or document them in @IMPLEMENTATION_PLAN.md using a subagent even if it is unrelated to the current piece of work.
+999999999999. Implement functionality completely. Placeholders and stubs waste efforts and time redoing the same work.
+9999999999999. When @IMPLEMENTATION_PLAN.md becomes large periodically clean out the items that are completed from the file using a subagent.
+99999999999999. If you find inconsistencies in the specs/* then use an Opus subagent with 'ultrathink' requested to update the specs.
+999999999999999. IMPORTANT: Keep @AGENTS.md operational only — status updates and progress notes belong in IMPLEMENTATION_PLAN.md. A bloated AGENTS.md pollutes every future loop's context.
+
+---
+
+<task-notification>
+<task-id>a7ed4f3</task-id>
+<status>completed</status>
+<summary>Agent "Read all spec files" completed</summary>
+<result>Here is a comprehensive summary of each spec file:
+
+## 1. coding-agent.md
+**What it specifies**: A unified Rust coding agent with a single binary, streaming responses, and 5 tools, targeting under 950 production lines.
+
+**Key requirements and constraints**:
+- REPL loop with streaming SSE responses from Anthropic API
+- HTTP client built with reqwest (not third-party Anthropic crate)
+- Tool registry pattern using a `tools!` macro for schema generation
+- Five tools: Read (file contents), Glob (file listing), Bash (command execution with streaming), Edit (exact-match file editing with replace_all option), Grep (search via ripgrep)
+- CLI with flags for verbose, model, and max-tokens
+- Error handling via thiserror for structured errors
+- Token-aware context trimming at 720KB budget (~180K tokens)
+- Bash command guard deny-list for destructive operations
+- Dynamic system prompt with cwd, platform info, and tool guidance
+
+**Success criteria**:
+- Binary compiles, tests pass, clippy clean, formatted
+- All 5 tools functional
+- Streaming responses visible in real-time
+- Under 950 production lines
+
+**Test requirements**: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+
+## 2. tool-name-compliance.md
+**What it specifies**: Rename forgeflare's tool names from snake_case to PascalCase to match Claude Code conventions for OAuth proxy compatibility.
+
+**Key requirements and constraints**:
+- Rename tool schemas: `read_file` → `Read`, `list_files` → `Glob`, `bash` → `Bash`, `edit_file` → `Edit`, `code_search` → `Grep`
+- Update dispatch match arms, system prompt, and all tests
+- Only the `name` field changes; descriptions and schemas remain unchanged
+- Internal function names (`read_exec`, etc.) stay the same
+
+**Success criteria**:
+- All tests pass with new tool names
+- Requests through OAuth proxy with tools succeed
+- System prompt references new names
+
+**Test requirements**: `cargo test`, `cargo clippy -- -D warnings`
+
+## 3. api-endpoint.md
+**What it specifies**: Route API requests through a configurable endpoint, defaulting to the tailnet OAuth proxy instead of direct Anthropic API.
+
+**Key requirements and constraints**:
+- Add configurable `api_url` to `AnthropicClient` with default `https://anthropic-oauth-proxy.tailfb3ea.ts.net`
+- Override via `--api-url` CLI arg or `ANTHROPIC_API_URL` env var
+- Make `ANTHROPIC_API_KEY` optional (only attach header when set)
+- Remove `MissingApiKey` error variant
+- Proxy operates in passthrough mode (with key) or OAuth pool mode (without)
+
+**Success criteria**:
+- `cargo run` on tailnet works with zero env vars
+- Direct API access works with API key and `--api-url`
+- SSE streaming works through proxy
+- `--api-url` appears in help
+
+**Test requirements**: Existing tests pass with api_key provided
+
+## 4. api-retry.md
+**What it specifies**: Retry transient API errors (429, 503, 529, timeouts) with exponential backoff instead of breaking the inner loop.
+
+**Key requirements and constraints**:
+- Classify errors as transient (429, 503, 529, timeouts, overload SSE events) vs permanent (400, 401, 403, malformed JSON)
+- Split `AgentError` variants: add `HttpError`, `StreamTransient`, keep `StreamParse`, `Api`, `Json`
+- Retry with exponential backoff: 2s, 4s, 8s, 16s (max 4 retries)
+- Respect `retry-after` header when present (capped at 60s)
+- Permanent errors skip retry and go directly to recover_conversation + break
+
+**Success criteria**:
+- 429/503 responses retried with appropriate delays
+- Network timeouts retried
+- 400 responses trigger immediate break
+- Max 4 retries enforced
+- Retry attempts logged
+
+**Test requirements**: Existing tests pass for non-error paths
+
+## 5. session-capture.md
+**What it specifies**: Persist conversation transcripts to disk in Entire-compatible JSONL format for post-session observability.
+
+**Key requirements and constraints**:
+- Write JSONL to `.entire/metadata/{session-id}/full.jsonl` with one JSON object per line
+- Each line includes: sessionId, uuid, parentUuid, timestamp, cwd, version, message
+- Parse token usage from API SSE events (`message_start`, `message_delta`)
+- Generate session ID as `{date}-{uuid}` format
+- Write incrementally (survives mid-session crash)
+- Supporting files: `prompt.txt`, `context.md` (session metadata + key actions)
+
+**Success criteria**:
+- JSONL written incrementally
+- Token usage attached to assistant turns
+- Timestamps on every turn (UTC ISO 8601)
+- prompt.txt survives mid-session crash
+- JSONL readable by jq line-by-line
+
+**Test requirements**: No performance regression in conversation loop
+
+## 6. maxtoken-continuation.md
+**What it specifies**: Recover from MaxTokens truncation by prompting the LLM to continue instead of breaking the inner loop.
+
+**Key requirements and constraints**:
+- Detect text-only truncation (no valid tool_use blocks after filtering)
+- Inject continuation prompt: "Continue from where you left off."
+- Cap at 3 continuation attempts per inner loop
+- Don't increment `tool_iterations` for continuations
+- If valid tools remain after MaxTokens, dispatch them normally
+- Empty MaxTokens response (only placeholder) triggers immediate break
+
+**Success criteria**:
+- Text-only MaxTokens triggers continuation
+- Tool_use MaxTokens falls through to dispatch
+- Continuation capped at 3 attempts
+- Continuation logged to JSONL transcript
+- `continuation_count` doesn't increment `tool_iterations`
+
+**Test requirements**: Existing MaxTokens filter tests pass
+
+## 7. token-aware-trim.md
+**What it specifies**: Use actual API token counts to inform context trim decisions instead of relying solely on byte-size heuristics.
+
+**Key requirements and constraints**:
+- Track `last_input_tokens` from API usage data
+- Skip trim when `last_input_tokens > 0 && < 120K` (60% of 200K context)
+- Run byte-based trim as safety net when `last_input_tokens == 0` or >= threshold
+- Constants: `MODEL_CONTEXT_TOKENS = 200_000`, `TRIM_THRESHOLD = 120_000`
+- 60% threshold leaves 80K tokens headroom for tool results
+
+**Success criteria**:
+- First API call always runs byte-based trim
+- Subsequent calls skip trim when under threshold
+- Byte-based trim fires when >= 120K tokens
+- `last_input_tokens` resets on new user input
+
+**Test requirements**: Existing trim tests pass
+
+## 8. tool-parallelism.md
+**What it specifies**: Classify tools by side effects and execute read-only tools concurrently within a single tool batch.
+
+**Key requirements and constraints**:
+- Define `ToolEffect` enum: Pure (Read, Glob, Grep) vs Mutating (Bash, Edit)
+- Batch classification: all pure → concurrent dispatch, any mutating → sequential
+- Use `futures_util::future::join_all()` for concurrent dispatch
+- Preserve ordering with tool results
+- Both paths must replicate null-input guard and increment `tool_iterations`
+
+**Success criteria**:
+- 3 concurrent Reads complete faster than sequential
+- Mixed batches dispatch sequentially
+- Tool results maintain original ordering
+- Individual tool errors don't cancel siblings
+- Unknown tools classified as Mutating
+
+**Test requirements**: Existing sequential dispatch tests pass
+
+## 9. hooks.md
+**What it specifies**: Shell-based hook system with three lifecycle events (PreToolUse guard, PostToolUse observation, Stop finalization) for Ralph loop integration.
+
+**Key requirements and constraints**:
+- Three hook events: PreToolUse (guard + observe phases), PostToolUse, Stop
+- TOML config at `.forgeflare/hooks.toml`
+- PreToolUse guard is fail-closed (can block); observe is fail-open (audit only)
+- PostToolUse can signal convergence; Stop finalizes
+- Block counters: consecutive (3) and total (10) with inner loop break
+- Convergence state written to `.forgeflare/convergence.json` (atomic writes)
+- PostToolUse result capped at 5KB for hook stdin
+- `tool_iterations` increments per batch, not per tool
+
+**Success criteria**:
+- Guard hooks can block with distinct error messages
+- Observe hooks run after blocks with block context
+- PostToolUse signal triggers inner loop break
+- Block counters trigger break with `conversation.pop()`
+- Convergence state has distinct `observations`/`final` keys
+- No hooks.toml → zero overhead
+
+**Test requirements**: `dispatch_tool` remains sync, signature unchanged
+
+## 10. release-workflow.md
+**What it specifies**: Cross-platform release binaries via GitHub Actions, triggered by version tags.
+
+**Key requirements and constraints**:
+- Trigger on `v*` tag push
+- Build matrix: macOS aarch64 (Apple Silicon) + Linux x86_64
+- Each target: test suite → release build → tarball
+- Tarball naming: `forgeflare-{tag}-{target}.tar.gz`
+- GitHub Release with auto-generated changelog
+- CI gate: release depends on lint/audit/test passing
+- Pin all action SHAs, least-privilege permissions
+
+**Success criteria**:
+- Tag push triggers workflow
+- Both binaries compile and test
+- Tarballs attached to GitHub Release
+- Release blocked on CI failures
+
+**Test requirements**: Tests pass on both platforms before packaging
+
+## 11. README.md
+**What it specifies**: Implementation order index for all specs to avoid structural conflicts.
+
+**Key requirements and constraints**:
+- Sequential implementation from 1-10 to prevent merge conflicts
+- Order accounts for overlapping changes in main.rs and api.rs
+- Foundation (coding-agent) must be first
+- tool-name-compliance must be applied during initial implementation
+- Hooks spec depends on final shape of both sequential/parallel dispatch paths
+- Release workflow can be done anytime after build works
+
+This represents a complete coding agent with advanced features like retry logic, session persistence, intelligent context management, parallel tool execution, and extensible hook system for autonomous operation.</result>
+<usage>total_tokens: 52549
+tool_uses: 11
+duration_ms: 71215</usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-dev-forge-forgeflare-hooks/tasks/a7ed4f3.output
+
+---
+
+<task-notification>
+<task-id>a36162b</task-id>
+<status>completed</status>
+<summary>Agent "Audit hooks spec vs impl" completed</summary>
+<result>Based on my thorough audit of the hooks implementation against the specification, I found **1 gap**:
+
+## Gap Found
+
+**1. Convergence JSON key name mismatch (spec violation)**
+
+The spec at R8 line 259 specifies the final state should be written under the key `"final"`:
+
+```json
+{
+  "observations": [...],
+  "final": {
+    "reason": "convergence_signal",
+    ...
+  }
+}
+```
+
+However, the implementation in `/Users/basher8383/dev/forge/forgeflare-hooks/src/hooks.rs` line 44 uses the struct field name `final_state` which serializes to the JSON key `"final_state"`:
+
+```rust
+struct ConvergenceState {
+    #[serde(default)]
+    observations: Vec<Observation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_state: Option<FinalState>,  // ← serializes as "final_state", not "final"
+}
+```
+
+The Rust struct field should use `#[serde(rename = "final")]` to match the spec's required JSON key name.
+
+---
+
+## All Other Requirements Verified
+
+I confirmed the following are correctly implemented:
+
+1. **All hook events implemented** - PreToolUse, PostToolUse, Stop (lines 123-388 in hooks.rs)
+2. **Guard hooks are fail-closed** - timeout/crash/invalid JSON all block (lines 180-206)
+3. **Observe hooks are fail-open** - errors logged but don't affect outcome (lines 238-243)
+4. **PostToolUse signal handling** - signal_break flag set, break after batch without recover_conversation (main.rs lines 501, 654, 735, 769-771)
+5. **Convergence state writes** - observations append, final writes once (hooks.rs lines 481-536)
+6. **Block thresholds** - consecutive=3 (line 22), total=10 (line 23), both implemented (main.rs lines 536-548, 685-698)
+7. **Stop hook payload** - includes all required fields: event, reason, tool_iterations, total_tokens, cwd (hooks.rs lines 347-352)
+8. **All 7 stop reasons handled** - end_turn, iteration_limit, api_error, continuation_cap, block_limit_consecutive, block_limit_total, convergence_signal (main.rs lines 328, 339, 372, 380, 452, 477, 541, 547, 690, 696, 752, 770; verified by test at hooks.rs lines 1383-1408)</result>
+<usage>total_tokens: 67772
+tool_uses: 5
+duration_ms: 27667</usage>
+</task-notification>
+Full transcript available at: REDACTED.output

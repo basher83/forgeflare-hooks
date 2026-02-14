@@ -1,12 +1,17 @@
 mod api;
 mod tools;
 
-use api::{AgentError, AnthropicClient, ContentBlock, Message, StopReason};
+use api::{
+    classify_error, AgentError, AnthropicClient, ContentBlock, ErrorClass, Message, StopReason,
+};
 use clap::Parser;
 use std::io::{self, BufRead, Read as _, Write};
 use tools::{all_tool_schemas, dispatch_tool};
 
 const MAX_TOOL_ITERATIONS: usize = 50;
+const MAX_RETRIES: usize = 4;
+const BACKOFF_SCHEDULE: [u64; 4] = [2, 4, 8, 16];
+const RETRY_AFTER_CAP: u64 = 60;
 const CONTEXT_BUDGET_BYTES: usize = 720_000;
 
 #[derive(Parser)]
@@ -283,34 +288,75 @@ async fn run_turn(
             break;
         }
 
-        let result = client
-            .send_message(
-                &cli.model,
-                cli.max_tokens,
-                system_prompt,
-                conversation,
-                tools,
-                &mut |text| {
-                    print!("{text}");
-                    io::stdout().flush().ok();
-                },
-            )
-            .await;
+        // Retry loop wrapping the API call
+        // attempt 0 = initial call, 1..=MAX_RETRIES = retries
+        let mut api_result = None;
+        #[allow(clippy::needless_range_loop)]
+        for attempt in 0..=MAX_RETRIES {
+            let result = client
+                .send_message(
+                    &cli.model,
+                    cli.max_tokens,
+                    system_prompt,
+                    conversation,
+                    tools,
+                    &mut |text| {
+                        print!("{text}");
+                        io::stdout().flush().ok();
+                    },
+                )
+                .await;
 
-        let (blocks, stop_reason) = match result {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("\n[error] API call failed: {e}");
-                if let AgentError::HttpError {
-                    retry_after: Some(ra),
-                    ..
-                } = &e
-                {
-                    eprintln!("[info] Retry-After: {ra}s");
+            match result {
+                Ok(r) => {
+                    api_result = Some(r);
+                    break;
                 }
-                recover_conversation(conversation);
-                break;
+                Err(e) => {
+                    eprintln!("\n[error] API call failed: {e}");
+
+                    if classify_error(&e) == ErrorClass::Permanent {
+                        recover_conversation(conversation);
+                        break;
+                    }
+
+                    // Transient error — retry if attempts remain
+                    if attempt >= MAX_RETRIES {
+                        eprintln!("[retry] Max retries ({MAX_RETRIES}) exhausted");
+                        recover_conversation(conversation);
+                        break;
+                    }
+
+                    // Determine delay: retry-after header overrides backoff
+                    let delay = if let AgentError::HttpError {
+                        retry_after: Some(ra),
+                        ..
+                    } = &e
+                    {
+                        let capped = (*ra).min(RETRY_AFTER_CAP);
+                        eprintln!("[retry] Using retry-after: {capped}s");
+                        capped
+                    } else {
+                        BACKOFF_SCHEDULE[attempt]
+                    };
+
+                    if matches!(e, AgentError::StreamTransient(_)) {
+                        eprintln!("[retry] Retrying from beginning of response...");
+                    }
+
+                    eprintln!(
+                        "[retry] Attempt {}/{MAX_RETRIES}: {} — waiting {delay}s",
+                        attempt + 1,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
             }
+        }
+
+        let (blocks, stop_reason) = match api_result {
+            Some(r) => r,
+            None => break, // All retries failed or permanent error
         };
 
         // Filter null-input tool_use blocks for MaxTokens truncation
@@ -535,5 +581,48 @@ mod tests {
         let val = serde_json::json!({"key": "a very long value that exceeds the truncation limit"});
         let s = truncate_json(&val, 20);
         assert!(s.contains("..."));
+    }
+
+    #[test]
+    fn backoff_schedule_values() {
+        assert_eq!(BACKOFF_SCHEDULE, [2, 4, 8, 16]);
+        assert_eq!(MAX_RETRIES, 4);
+        assert_eq!(RETRY_AFTER_CAP, 60);
+    }
+
+    #[test]
+    fn permanent_error_skips_retry() {
+        // Verify that classify_error returns Permanent for 400
+        let e = AgentError::HttpError {
+            status: 400,
+            retry_after: None,
+            body: "bad request".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn transient_error_allows_retry() {
+        let e = AgentError::HttpError {
+            status: 429,
+            retry_after: Some(5),
+            body: "rate limited".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn retry_after_cap_applied() {
+        // retry_after of 120 should be capped to RETRY_AFTER_CAP (60)
+        let ra: u64 = 120;
+        let capped = ra.min(RETRY_AFTER_CAP);
+        assert_eq!(capped, 60);
+    }
+
+    #[test]
+    fn retry_after_zero_is_immediate() {
+        let ra: u64 = 0;
+        let capped = ra.min(RETRY_AFTER_CAP);
+        assert_eq!(capped, 0);
     }
 }

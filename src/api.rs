@@ -25,6 +25,32 @@ pub enum AgentError {
     StreamParse(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ErrorClass {
+    Transient,
+    Permanent,
+}
+
+pub fn classify_error(e: &AgentError) -> ErrorClass {
+    match e {
+        AgentError::HttpError { status, .. } => match *status {
+            429 | 503 | 529 => ErrorClass::Transient,
+            s if s >= 500 => ErrorClass::Transient,
+            _ => ErrorClass::Permanent,
+        },
+        AgentError::StreamTransient(_) => ErrorClass::Transient,
+        AgentError::StreamParse(_) => ErrorClass::Permanent,
+        AgentError::Api(e) => {
+            if e.is_timeout() || e.is_connect() {
+                ErrorClass::Transient
+            } else {
+                ErrorClass::Permanent
+            }
+        }
+        AgentError::Json(_) => ErrorClass::Permanent,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StopReason {
     #[serde(rename = "end_turn")]
@@ -474,5 +500,95 @@ mod tests {
     fn client_strips_trailing_slash() {
         let client = AnthropicClient::new("https://example.com/");
         assert_eq!(client.api_url(), "https://example.com");
+    }
+
+    #[test]
+    fn classify_http_429_transient() {
+        let e = AgentError::HttpError {
+            status: 429,
+            retry_after: Some(5),
+            body: "rate limited".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn classify_http_503_transient() {
+        let e = AgentError::HttpError {
+            status: 503,
+            retry_after: None,
+            body: "overloaded".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn classify_http_529_transient() {
+        let e = AgentError::HttpError {
+            status: 529,
+            retry_after: None,
+            body: "overloaded".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn classify_http_500_transient() {
+        let e = AgentError::HttpError {
+            status: 500,
+            retry_after: None,
+            body: "internal error".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn classify_http_400_permanent() {
+        let e = AgentError::HttpError {
+            status: 400,
+            retry_after: None,
+            body: "bad request".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn classify_http_401_permanent() {
+        let e = AgentError::HttpError {
+            status: 401,
+            retry_after: None,
+            body: "unauthorized".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn classify_http_403_permanent() {
+        let e = AgentError::HttpError {
+            status: 403,
+            retry_after: None,
+            body: "forbidden".to_string(),
+        };
+        assert_eq!(classify_error(&e), ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn classify_stream_transient() {
+        let e = AgentError::StreamTransient("overloaded_error: Overloaded".to_string());
+        assert_eq!(classify_error(&e), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn classify_stream_parse_permanent() {
+        let e = AgentError::StreamParse("invalid_request_error: Bad request".to_string());
+        assert_eq!(classify_error(&e), ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn classify_json_permanent() {
+        let e: AgentError = serde_json::from_str::<serde_json::Value>("not json")
+            .unwrap_err()
+            .into();
+        assert_eq!(classify_error(&e), ErrorClass::Permanent);
     }
 }

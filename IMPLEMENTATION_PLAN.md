@@ -2,7 +2,7 @@
 
 Project state: greenfield. Zero source code exists — no `Cargo.toml`, no `src/` directory, no `.rs` files, no `.github/workflows/`. All 10 specs are authored and complete. The Ralph loop harness (`loop.sh`), AGENTS.md, CLAUDE.md, and mise.toml are configured. Implementation follows the order defined in `specs/README.md` to avoid structural conflicts.
 
-Updated 2026-02-14: Items 1-4 complete. 60 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names. Session capture writes JSONL incrementally, parses usage from SSE events.
+Updated 2026-02-14: Items 1-5 complete. 66 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names. Session capture writes JSONL incrementally, parses usage from SSE events. MaxTokens continuation injects "Continue from where you left off." up to 3 times for text-only truncations; tool_use MaxTokens falls through to dispatch.
 
 ## 1. Foundation: `coding-agent.md` + `tool-name-compliance.md` (combined)
 
@@ -46,12 +46,8 @@ Depends on: items 1-3 (needs `send_message()` return value, `Usage` struct, and 
 
 Depends on: items 1-4 (restructures inner loop control flow; needs session capture for continuation prompt logging).
 
-- [ ] **5a. `src/main.rs` — Control flow restructure** — Add `let mut continuation_count: usize = 0;` alongside `tool_iterations`. Replace `if stop_reason != StopReason::ToolUse { break; }` with canonical three-way branch:
-  - `EndTurn` → break
-  - `MaxTokens` → filter null-input tool_use blocks (existing), inject placeholder if empty (existing); then: if empty after filter (only placeholder, no real content) → break; if has valid tool_use blocks → fall through to dispatch (do NOT increment continuation_count); else if `continuation_count < 3` → increment, push User("Continue from where you left off."), `session.append_user_turn()`, log `[continue]`, continue inner loop; else → log `[continue] Max continuations reached`, break
-  - `ToolUse` → fall through to dispatch
-  - `continuation_count` resets on outer loop user input only (not on tool_result pushes within inner loop). Does NOT increment `tool_iterations`.
-- [ ] **5b. Tests** — Text-only MaxTokens triggers continuation (count increments, User message pushed). Tool_use MaxTokens falls through to dispatch (continuation_count unchanged). Cap enforcement (4th attempt breaks). Empty MaxTokens (placeholder only) breaks immediately. Counter reset on new user input (outer loop).
+- [x] **5a. `src/main.rs` — Control flow restructure** — Added `continuation_count` alongside `tool_iterations`. Replaced `match stop_reason` with canonical three-way branch: EndTurn breaks, MaxTokens branches via `classify_max_tokens()` (BreakEmpty/DispatchTools/Continue/BreakCapReached), ToolUse falls through to dispatch. Extracted `classify_max_tokens()` and `MaxTokensAction` enum for testability. `continuation_count` resets per outer loop (scoped to `run_turn()`). Does NOT increment `tool_iterations`.
+- [x] **5b. Tests** — 6 new tests: text-only continuation (all 3 counts), tool_use dispatch (with/without text), cap enforcement (count=3 and beyond), empty response breaks, tool_use-only dispatch, MAX_CONTINUATIONS constant. 66 total tests pass.
 
 ## 6. Token-Aware Trim: `token-aware-trim.md`
 
@@ -128,3 +124,5 @@ The `reference/go-source/` directory referenced by `coding-agent.md` does not ex
 - `Usage` struct placed in `api.rs` alongside other API types, re-exported to `session.rs` via `crate::api::Usage`
 - `StopReason` already had `Serialize` derive from item 1, no change needed (spec said to add it)
 - SSE `message_start` carries usage at `message.usage` (nested), while `message_delta` carries usage at top-level `usage`
+- Extracted `classify_max_tokens()` with `MaxTokensAction` enum from inline branch logic — makes the MaxTokens decision testable without needing a full API client mock
+- `continuation_count` is naturally scoped to `run_turn()` — each call to `run_turn()` gets a fresh count, so outer-loop reset happens for free

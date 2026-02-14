@@ -298,6 +298,7 @@ async fn run_turn(
     trim_conversation(conversation);
 
     let mut tool_iterations: usize = 0;
+    let mut continuation_count: usize = 0;
 
     // Inner loop: call API, dispatch tools, repeat
     loop {
@@ -378,7 +379,7 @@ async fn run_turn(
             None => break, // All retries failed or permanent error
         };
 
-        // Filter null-input tool_use blocks for MaxTokens truncation
+        // Filter null-input tool_use blocks on MaxTokens truncation
         let blocks = if stop_reason == StopReason::MaxTokens {
             filter_null_input_tool_use(blocks)
         } else {
@@ -393,74 +394,105 @@ async fn run_turn(
         conversation.push(assistant_msg.clone());
         session.append_assistant_turn(&assistant_msg, &usage);
 
-        match stop_reason {
-            StopReason::EndTurn => {
-                println!();
-                break;
-            }
-            StopReason::MaxTokens => {
-                println!();
-                eprintln!("[info] Response truncated (max_tokens)");
-                break;
-            }
-            StopReason::ToolUse => {
-                // Dispatch tools
-                let mut tool_results: Vec<ContentBlock> = Vec::new();
+        // --- Canonical three-way branch ---
 
-                for block in &blocks {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
-                        if input.is_null() {
-                            continue;
-                        }
+        // 1. EndTurn — normal completion
+        if stop_reason == StopReason::EndTurn {
+            println!();
+            break;
+        }
 
-                        if cli.verbose {
-                            eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
-                        } else {
-                            eprintln!("\n[tool] {name}");
-                        }
+        // 2. MaxTokens — filter, then decide: continue, dispatch tools, or break
+        if stop_reason == StopReason::MaxTokens {
+            println!();
 
-                        let result = dispatch_tool(name, input, &mut |text| {
-                            if cli.verbose {
-                                eprint!("{text}");
-                            }
-                        });
-
-                        let (content, is_error) = match result {
-                            Ok(output) => {
-                                let display =
-                                    format_tool_result_display(&output, false, cli.verbose);
-                                eprintln!("{display}");
-                                (output, false)
-                            }
-                            Err(err) => {
-                                let display = format_tool_result_display(&err, true, cli.verbose);
-                                eprintln!("{display}");
-                                (err, true)
-                            }
-                        };
-
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content,
-                            is_error: if is_error { Some(true) } else { None },
-                        });
-                    }
-                }
-
-                if tool_results.is_empty() {
+            match classify_max_tokens(&blocks, continuation_count) {
+                MaxTokensAction::BreakEmpty => {
+                    eprintln!("[info] Empty response at max_tokens, breaking");
                     break;
                 }
+                MaxTokensAction::DispatchTools => {
+                    // Valid tool_use blocks — fall through to tool dispatch below.
+                    // Do NOT increment continuation_count.
+                }
+                MaxTokensAction::Continue => {
+                    continuation_count += 1;
+                    eprintln!(
+                        "[continue] Response truncated at max_tokens, requesting continuation ({}/{})",
+                        continuation_count, MAX_CONTINUATIONS
+                    );
 
-                let tool_msg = Message {
-                    role: "user".to_string(),
-                    content: tool_results,
-                };
-                conversation.push(tool_msg.clone());
-                session.append_user_turn(&tool_msg);
-
-                tool_iterations += 1;
+                    let cont_msg = Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "Continue from where you left off.".to_string(),
+                        }],
+                    };
+                    conversation.push(cont_msg.clone());
+                    session.append_user_turn(&cont_msg);
+                    continue;
+                }
+                MaxTokensAction::BreakCapReached => {
+                    eprintln!("[continue] Max continuations reached, breaking");
+                    break;
+                }
             }
         }
+
+        // 3. Tool dispatch — runs for both ToolUse and MaxTokens-with-valid-tools
+        let mut tool_results: Vec<ContentBlock> = Vec::new();
+
+        for block in &blocks {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                if input.is_null() {
+                    continue;
+                }
+
+                if cli.verbose {
+                    eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
+                } else {
+                    eprintln!("\n[tool] {name}");
+                }
+
+                let result = dispatch_tool(name, input, &mut |text| {
+                    if cli.verbose {
+                        eprint!("{text}");
+                    }
+                });
+
+                let (content, is_error) = match result {
+                    Ok(output) => {
+                        let display = format_tool_result_display(&output, false, cli.verbose);
+                        eprintln!("{display}");
+                        (output, false)
+                    }
+                    Err(err) => {
+                        let display = format_tool_result_display(&err, true, cli.verbose);
+                        eprintln!("{display}");
+                        (err, true)
+                    }
+                };
+
+                tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content,
+                    is_error: if is_error { Some(true) } else { None },
+                });
+            }
+        }
+
+        if tool_results.is_empty() {
+            break;
+        }
+
+        let tool_msg = Message {
+            role: "user".to_string(),
+            content: tool_results,
+        };
+        conversation.push(tool_msg.clone());
+        session.append_user_turn(&tool_msg);
+
+        tool_iterations += 1;
     }
 }
 
@@ -470,6 +502,43 @@ fn truncate_json(value: &serde_json::Value, max_len: usize) -> String {
         s
     } else {
         format!("{}...", &s[..s.floor_char_boundary(max_len)])
+    }
+}
+
+const MAX_CONTINUATIONS: usize = 3;
+
+/// Determine what to do after a MaxTokens stop_reason.
+/// Returns the action to take given the filtered content blocks and current continuation count.
+#[derive(Debug, PartialEq)]
+enum MaxTokensAction {
+    /// Response was empty (only placeholder) — break immediately
+    BreakEmpty,
+    /// Valid tool_use blocks present — fall through to tool dispatch
+    DispatchTools,
+    /// Text-only, under cap — inject continuation prompt
+    Continue,
+    /// Text-only, cap reached — break
+    BreakCapReached,
+}
+
+fn classify_max_tokens(blocks: &[ContentBlock], continuation_count: usize) -> MaxTokensAction {
+    // Check for empty response (only the "[Response truncated]" placeholder)
+    let is_empty = blocks.len() == 1
+        && matches!(&blocks[0], ContentBlock::Text { text } if text == "[Response truncated]");
+    if is_empty {
+        return MaxTokensAction::BreakEmpty;
+    }
+
+    let has_valid_tools = blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+    if has_valid_tools {
+        MaxTokensAction::DispatchTools
+    } else if continuation_count < MAX_CONTINUATIONS {
+        MaxTokensAction::Continue
+    } else {
+        MaxTokensAction::BreakCapReached
     }
 }
 
@@ -647,5 +716,87 @@ mod tests {
         let ra: u64 = 0;
         let capped = ra.min(RETRY_AFTER_CAP);
         assert_eq!(capped, 0);
+    }
+
+    // --- MaxTokens continuation tests ---
+
+    #[test]
+    fn max_tokens_text_only_triggers_continuation() {
+        let blocks = vec![ContentBlock::Text {
+            text: "partial response...".to_string(),
+        }];
+        assert_eq!(classify_max_tokens(&blocks, 0), MaxTokensAction::Continue);
+        assert_eq!(classify_max_tokens(&blocks, 1), MaxTokensAction::Continue);
+        assert_eq!(classify_max_tokens(&blocks, 2), MaxTokensAction::Continue);
+    }
+
+    #[test]
+    fn max_tokens_tool_use_dispatches_tools() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "Let me check...".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tu_1".to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({"file_path": "/tmp/test"}),
+            },
+        ];
+        // Tool_use MaxTokens falls through to dispatch regardless of continuation_count
+        assert_eq!(
+            classify_max_tokens(&blocks, 0),
+            MaxTokensAction::DispatchTools
+        );
+        assert_eq!(
+            classify_max_tokens(&blocks, 3),
+            MaxTokensAction::DispatchTools
+        );
+    }
+
+    #[test]
+    fn max_tokens_cap_enforcement() {
+        let blocks = vec![ContentBlock::Text {
+            text: "still going...".to_string(),
+        }];
+        // At count=3 (cap), should break
+        assert_eq!(
+            classify_max_tokens(&blocks, 3),
+            MaxTokensAction::BreakCapReached
+        );
+        // Beyond cap also breaks
+        assert_eq!(
+            classify_max_tokens(&blocks, 5),
+            MaxTokensAction::BreakCapReached
+        );
+    }
+
+    #[test]
+    fn max_tokens_empty_response_breaks_immediately() {
+        // The placeholder produced by filter_null_input_tool_use when all blocks removed
+        let blocks = vec![ContentBlock::Text {
+            text: "[Response truncated]".to_string(),
+        }];
+        // Empty breaks regardless of continuation_count
+        assert_eq!(classify_max_tokens(&blocks, 0), MaxTokensAction::BreakEmpty);
+        assert_eq!(classify_max_tokens(&blocks, 2), MaxTokensAction::BreakEmpty);
+    }
+
+    #[test]
+    fn max_tokens_tool_use_only_dispatches() {
+        // Only tool_use blocks (no text) — still dispatches
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "tu_1".to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+        }];
+        assert_eq!(
+            classify_max_tokens(&blocks, 0),
+            MaxTokensAction::DispatchTools
+        );
+    }
+
+    #[test]
+    fn max_continuations_constant() {
+        assert_eq!(MAX_CONTINUATIONS, 3);
     }
 }

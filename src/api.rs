@@ -87,6 +87,14 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
 pub struct AnthropicClient {
     client: Client,
     api_url: String,
@@ -126,7 +134,7 @@ impl AnthropicClient {
         messages: &[Message],
         tools: &[serde_json::Value],
         stream_callback: &mut dyn FnMut(&str),
-    ) -> Result<(Vec<ContentBlock>, StopReason), AgentError> {
+    ) -> Result<(Vec<ContentBlock>, StopReason, Usage), AgentError> {
         let url = format!("{}/v1/messages", self.api_url);
 
         let mut body = serde_json::json!({
@@ -173,20 +181,21 @@ impl AnthropicClient {
     }
 }
 
-/// Parse SSE stream into content blocks and stop reason.
+/// Parse SSE stream into content blocks, stop reason, and usage.
 ///
 /// We collect content_block_start events to initialize blocks, then
 /// content_block_delta events to append text or accumulate tool input JSON,
-/// and message_delta for the stop_reason.
+/// message_start for input usage, and message_delta for stop_reason + output usage.
 async fn parse_sse_stream<S>(
     stream: S,
     callback: &mut dyn FnMut(&str),
-) -> Result<(Vec<ContentBlock>, StopReason), AgentError>
+) -> Result<(Vec<ContentBlock>, StopReason, Usage), AgentError>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
     let mut stop_reason: Option<StopReason> = None;
+    let mut usage = Usage::default();
     let mut buffer = String::new();
 
     // Track in-progress tool_use input JSON accumulation per block index
@@ -218,6 +227,15 @@ where
                     let event_type = parsed["type"].as_str().unwrap_or("");
 
                     match event_type {
+                        "message_start" => {
+                            if let Some(u) = parsed.get("message").and_then(|m| m.get("usage")) {
+                                usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+                                usage.cache_creation_input_tokens =
+                                    u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                                usage.cache_read_input_tokens =
+                                    u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                            }
+                        }
                         "content_block_start" => {
                             let cb = &parsed["content_block"];
                             match cb["type"].as_str() {
@@ -287,6 +305,9 @@ where
                                     _ => None,
                                 };
                             }
+                            if let Some(u) = parsed.get("usage") {
+                                usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+                            }
                         }
                         "error" => {
                             let err_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
@@ -319,7 +340,7 @@ where
         )
     })?;
 
-    Ok((content_blocks, stop))
+    Ok((content_blocks, stop, usage))
 }
 
 #[cfg(test)]
@@ -398,7 +419,7 @@ mod tests {
         ))]);
 
         let mut streamed = String::new();
-        let (blocks, stop) = parse_sse_stream(stream, &mut |text| {
+        let (blocks, stop, _usage) = parse_sse_stream(stream, &mut |text| {
             streamed.push_str(text);
         })
         .await
@@ -431,7 +452,7 @@ mod tests {
         let stream =
             futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
 
-        let (blocks, stop) = parse_sse_stream(stream, &mut |_| {}).await.unwrap();
+        let (blocks, stop, _usage) = parse_sse_stream(stream, &mut |_| {}).await.unwrap();
 
         assert_eq!(stop, StopReason::ToolUse);
         assert_eq!(blocks.len(), 1);
@@ -590,5 +611,40 @@ mod tests {
             .unwrap_err()
             .into();
         assert_eq!(classify_error(&e), ErrorClass::Permanent);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_usage_from_message_start_and_delta() {
+        let sse_data = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1500,\"cache_creation_input_tokens\":200,\"cache_read_input_tokens\":800}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":350}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let (_blocks, _stop, usage) = parse_sse_stream(stream, &mut |_| {}).await.unwrap();
+
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 350);
+        assert_eq!(usage.cache_creation_input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 800);
+    }
+
+    #[test]
+    fn usage_default_is_zeros() {
+        let u = Usage::default();
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 0);
     }
 }

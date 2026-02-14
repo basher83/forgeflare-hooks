@@ -1,10 +1,12 @@
 mod api;
+mod session;
 mod tools;
 
 use api::{
     classify_error, AgentError, AnthropicClient, ContentBlock, ErrorClass, Message, StopReason,
 };
 use clap::Parser;
+use session::SessionWriter;
 use std::io::{self, BufRead, Read as _, Write};
 use tools::{all_tool_schemas, dispatch_tool};
 
@@ -195,6 +197,15 @@ async fn main() {
 
     let mut conversation: Vec<Message> = Vec::new();
 
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let mut session = SessionWriter::new(&cwd, &cli.model);
+
+    if cli.verbose {
+        eprintln!("[verbose] Session ID: {}", session.session_id());
+    }
+
     // Check for piped stdin
     let is_piped = !atty_check();
 
@@ -215,6 +226,7 @@ async fn main() {
             &system_prompt,
             &tools,
             &mut conversation,
+            &mut session,
             &input,
         )
         .await;
@@ -252,11 +264,14 @@ async fn main() {
                 &system_prompt,
                 &tools,
                 &mut conversation,
+                &mut session,
                 &input,
             )
             .await;
         }
     }
+
+    session.write_context();
 }
 
 async fn run_turn(
@@ -265,15 +280,19 @@ async fn run_turn(
     system_prompt: &str,
     tools: &[serde_json::Value],
     conversation: &mut Vec<Message>,
+    session: &mut SessionWriter,
     input: &str,
 ) {
     // Add user message
-    conversation.push(Message {
+    let user_msg = Message {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
             text: input.to_string(),
         }],
-    });
+    };
+    conversation.push(user_msg.clone());
+    session.append_user_turn(&user_msg);
+    session.write_prompt(input);
 
     // Trim context if needed
     trim_conversation(conversation);
@@ -354,7 +373,7 @@ async fn run_turn(
             }
         }
 
-        let (blocks, stop_reason) = match api_result {
+        let (blocks, stop_reason, usage) = match api_result {
             Some(r) => r,
             None => break, // All retries failed or permanent error
         };
@@ -367,10 +386,12 @@ async fn run_turn(
         };
 
         // Add assistant response to conversation
-        conversation.push(Message {
+        let assistant_msg = Message {
             role: "assistant".to_string(),
             content: blocks.clone(),
-        });
+        };
+        conversation.push(assistant_msg.clone());
+        session.append_assistant_turn(&assistant_msg, &usage);
 
         match stop_reason {
             StopReason::EndTurn => {
@@ -430,10 +451,12 @@ async fn run_turn(
                     break;
                 }
 
-                conversation.push(Message {
+                let tool_msg = Message {
                     role: "user".to_string(),
                     content: tool_results,
-                });
+                };
+                conversation.push(tool_msg.clone());
+                session.append_user_turn(&tool_msg);
 
                 tool_iterations += 1;
             }

@@ -2,7 +2,7 @@
 
 Project state: greenfield. Zero source code exists — no `Cargo.toml`, no `src/` directory, no `.rs` files, no `.github/workflows/`. All 10 specs are authored and complete. The Ralph loop harness (`loop.sh`), AGENTS.md, CLAUDE.md, and mise.toml are configured. Implementation follows the order defined in `specs/README.md` to avoid structural conflicts.
 
-Updated 2026-02-14: Items 1 (Foundation) and 2 (API Endpoint Configuration) are complete. 33 tests pass, clippy clean, fmt clean. Binary compiles and all 5 tools work with PascalCase names.
+Updated 2026-02-14: Items 1-4 complete. 60 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names. Session capture writes JSONL incrementally, parses usage from SSE events.
 
 ## 1. Foundation: `coding-agent.md` + `tool-name-compliance.md` (combined)
 
@@ -36,11 +36,11 @@ Depends on: items 1-2 (modifies error handling in `api.rs` and the `send_message
 
 Depends on: items 1-3 (needs `send_message()` return value, `Usage` struct, and retry loop in place).
 
-- [ ] **4a. `Cargo.toml`** — Add `uuid` (v4 feature) and `chrono` for timestamps.
-- [ ] **4b. `src/session.rs` (new module)** — Session ID generation (`{YYYY-MM-DD}-{uuid-v4}`). `SessionWriter` struct. JSONL line wrapper struct with `type` (user/assistant), `sessionId`, `uuid` (per-line unique), `parentUuid` (previous line's uuid, null for first), `timestamp` (UTC ISO 8601), `cwd`, `version` (`env!("CARGO_PKG_VERSION")`), `message` (the existing `Message` struct). `append_user_turn()` and `append_assistant_turn()` methods. `write_prompt()` for prompt.txt. `write_context()` for context.md (session metadata header + key actions list from tool_use blocks: `- **{tool_name}**: {first_arg_value}`). File I/O: `OpenOptions::new().create(true).append(true)` per write (no persistent handle). Directory creation: `create_dir_all(".entire/metadata/{session-id}/")`.
-- [ ] **4c. `src/api.rs`** — Parse `usage` from `message_start` (has `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`) and `message_delta` (has `output_tokens`) SSE events. `Usage` struct with four `u64` fields. Return as third element: `send_message() -> Result<(Vec<ContentBlock>, StopReason, Usage), AgentError>`. Add `Serialize` to `StopReason` derive list.
-- [ ] **4d. `src/main.rs`** — Generate session ID at startup. Create `SessionWriter`. Append user turn after each user input push. Append assistant turn after each assistant response. Write `prompt.txt` on first user input. Write `context.md` at session end (before process exit). Continuation prompts also captured via `session.append_user_turn()`.
-- [ ] **4e. Tests** — JSONL format validation (each line is valid JSON via `serde_json::from_str`). Session ID format regex (`\d{4}-\d{2}-\d{2}-[0-9a-f-]{36}`). Timestamp presence and ISO 8601 format. `parentUuid` chaining (each line's parentUuid = previous line's uuid). Usage parsing from mock SSE events (message_start + message_delta).
+- [x] **4a. `Cargo.toml`** — Add `uuid` (v4 feature) and `chrono` for timestamps. Added `tempfile` as dev-dependency for session tests.
+- [x] **4b. `src/session.rs` (new module)** — Session ID generation (`{YYYY-MM-DD}-{uuid-v4}`). `SessionWriter` struct. JSONL line wrapper struct with `type` (user/assistant), `sessionId`, `uuid` (per-line unique), `parentUuid` (previous line's uuid, null for first), `timestamp` (UTC ISO 8601), `cwd`, `version` (`env!("CARGO_PKG_VERSION")`), `message` (the existing `Message` struct). `append_user_turn()` and `append_assistant_turn()` methods. `write_prompt()` for prompt.txt. `write_context()` for context.md (session metadata header + key actions list from tool_use blocks: `- **{tool_name}**: {first_arg_value}`). File I/O: `OpenOptions::new().create(true).append(true)` per write (no persistent handle). Directory creation: `create_dir_all(".entire/metadata/{session-id}/")`.
+- [x] **4c. `src/api.rs`** — Parse `usage` from `message_start` (has `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`) and `message_delta` (has `output_tokens`) SSE events. `Usage` struct with four `u64` fields. Return as third element: `send_message() -> Result<(Vec<ContentBlock>, StopReason, Usage), AgentError>`. `StopReason` already had `Serialize` from item 1.
+- [x] **4d. `src/main.rs`** — Generate session ID at startup. Create `SessionWriter`. Append user turn after each user input push. Append assistant turn after each assistant response. Write `prompt.txt` on first user input. Write `context.md` at session end (before process exit). Continuation prompts also captured via `session.append_user_turn()`.
+- [x] **4e. Tests** — JSONL format validation (each line is valid JSON via `serde_json::from_str`). Session ID format regex (`\d{4}-\d{2}-\d{2}-[0-9a-f-]{36}`). Timestamp presence and ISO 8601 format. `parentUuid` chaining (each line's parentUuid = previous line's uuid). Usage parsing from mock SSE events (message_start + message_delta).
 
 ## 5. MaxTokens Continuation: `maxtoken-continuation.md`
 
@@ -112,7 +112,7 @@ The `reference/go-source/` directory referenced by `coding-agent.md` does not ex
 - Item 9 (release) is independent of Rust code and can be done anytime after `cargo build` works (item 1).
 - The `<950 production lines` constraint in `coding-agent.md` applies to the foundation (item 1). Later specs add code beyond this budget, which is expected — the constraint is about keeping the core tight, not limiting the full feature set.
 - The `tools!` macro in item 1d must use PascalCase names from day one (per `tool-name-compliance.md`). There is no separate rename step — the foundation ships with `Read`, `Glob`, `Bash`, `Edit`, `Grep`.
-- `send_message()` return type evolves: item 1 returns `(Vec<ContentBlock>, StopReason)`, item 4 changes to `(Vec<ContentBlock>, StopReason, Usage)`. All downstream code (items 5-8) uses the three-element tuple.
+- `send_message()` return type: now returns `(Vec<ContentBlock>, StopReason, Usage)` as of item 4. All downstream code (items 5-8) uses the three-element tuple.
 
 ## Learnings
 
@@ -124,3 +124,7 @@ The `reference/go-source/` directory referenced by `coding-agent.md` does not ex
 - reqwest needs the `json` feature for `.json()` request builder method
 - clippy's `needless_range_loop` lint fires when indexing into an array inside a range loop — use `#[allow]` when the loop range intentionally exceeds the array length (initial call + retries pattern)
 - The `AgentError` variants from item 1 already matched the retry spec's error classification needs — designing error types early pays off
+- `tempfile` crate needed as dev-dependency for session tests that create temp directories
+- `Usage` struct placed in `api.rs` alongside other API types, re-exported to `session.rs` via `crate::api::Usage`
+- `StopReason` already had `Serialize` derive from item 1, no change needed (spec said to add it)
+- SSE `message_start` carries usage at `message.usage` (nested), while `message_delta` carries usage at top-level `usage`

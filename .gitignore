@@ -1,0 +1,8 @@
+.DS_Store
+*.swp
+*.swo
+*~
+TASK.md
+.claude/convergence-count
+.claude/ralph-activity.log
+ralph.log

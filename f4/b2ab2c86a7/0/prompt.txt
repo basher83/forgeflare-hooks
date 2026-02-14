@@ -1,0 +1,633 @@
+0a. Study `specs/*` with up to 500 parallel subagents to learn the application specifications.
+0b. If @TASK.md exists, read it — this is your sole task for this iteration. Skip @IMPLEMENTATION_PLAN.md for task selection. Otherwise, study @IMPLEMENTATION_PLAN.md.
+0c. Study @AGENTS.md for build commands and code patterns.
+
+1. If @TASK.md exists, that is your SOLE task — implement it, do not consult @IMPLEMENTATION_PLAN.md for task selection. Otherwise, follow @IMPLEMENTATION_PLAN.md and choose the most important item to address. Before making changes, search the codebase (don't assume not implemented) using Sonnet subagents. You may use up to 500 parallel Sonnet subagents for searches/reads and only 1 Sonnet subagent for build/tests. Use Opus subagents when complex reasoning is needed (debugging, architectural decisions).
+2. After implementing functionality or resolving problems, run the tests for that unit of code that was improved. If functionality is missing then it's your job to add it as per the application specifications. Ultrathink.
+3. When you discover issues, immediately update @IMPLEMENTATION_PLAN.md with your findings using a subagent. When resolved, update and remove the item.
+4. When the tests pass: if working from @TASK.md, delete @TASK.md (its removal signals completion to the loop); otherwise, update @IMPLEMENTATION_PLAN.md. Then `git add -A` then `git commit` with a message describing the changes. After the commit, `git push`.
+
+99999. Important: When authoring documentation, capture the why — tests and implementation importance.
+999999. Important: Single sources of truth, no migrations/adapters. If tests unrelated to your work fail, resolve them as part of the increment.
+9999999. As soon as there are no build or test errors create a git tag. If there are no git tags start at 0.0.0 and increment patch by 1 for example 0.0.1 if 0.0.0 does not exist.
+99999999. You may add extra logging if required to debug issues.
+999999999. Keep @IMPLEMENTATION_PLAN.md current with learnings using a subagent — future work depends on this to avoid duplicating efforts. Update especially after finishing your turn.
+9999999999. When you learn something new about how to build/run the project, update @AGENTS.md using a subagent but keep it brief. For example if you run commands multiple times before learning the correct command then that file should be updated.
+99999999999. For any bugs you notice, resolve them or document them in @IMPLEMENTATION_PLAN.md using a subagent even if it is unrelated to the current piece of work.
+999999999999. Implement functionality completely. Placeholders and stubs waste efforts and time redoing the same work.
+9999999999999. When @IMPLEMENTATION_PLAN.md becomes large periodically clean out the items that are completed from the file using a subagent.
+99999999999999. If you find inconsistencies in the specs/* then use an Opus subagent with 'ultrathink' requested to update the specs.
+999999999999999. IMPORTANT: Keep @AGENTS.md operational only — status updates and progress notes belong in IMPLEMENTATION_PLAN.md. A bloated AGENTS.md pollutes every future loop's context.
+
+---
+
+<task-notification>
+<task-id>ae80dfc</task-id>
+<status>completed</status>
+<summary>Agent "Study all spec files" completed</summary>
+<result>## Comprehensive Spec Summary
+
+I've read all 11 spec files in `/Users/basher8383/dev/forge/forgeflare-hooks/specs/`. Here's a complete summary organized by spec:
+
+---
+
+## 1. **README.md** — Specs Index & Implementation Order
+
+A master index documenting the 10 active specs and their implementation sequence. The specs organize overlapping changes to `main.rs`, `api.rs`, and `src/hooks.rs` to avoid conflicts. Implementation order is critical: start with `coding-agent.md` (foundation), then apply `tool-name-compliance.md`, then `api-endpoint.md`, then `api-retry.md`, then `session-capture.md`, then `maxtoken-continuation.md`, then `token-aware-trim.md`, then `tool-parallelism.md`, then `hooks.md`, finally `release-workflow.md`.
+
+---
+
+## 2. **coding-agent.md** — Unified Rust Coding Agent (Foundation)
+
+**Core mission:** Single Rust binary, streaming API client, 5 tools, <950 production lines.
+
+**Key requirements:**
+- REPL loop: read user input → call Claude API → dispatch tools → repeat
+- Streaming responses via SSE from day 1
+- Custom HTTP client using `reqwest` (not third-party Anthropic crate)
+- Tool schemas generated via `tools!` macro; dispatch hand-written for per-tool signatures (Bash gets streaming callback)
+- **Five tools:** Read (file contents), Glob (directory listing), Bash (execute with timeout/streaming), Edit (exact-match replacement), Grep (ripgrep wrapper)
+- CLI: `--verbose`, `--model` (default: claude-opus-4-6), `--max-tokens` (default: 16384), stdin/interactive support
+- Error handling: `thiserror` for structured types, tool errors as `Result<String, String>` flowing to tool_result text
+- Conversation history: in-memory Vec<Message>, trimmed at 720KB budget (~180K tokens) to prevent unbounded growth
+- Safety: bash deny-list (blocks rm -rf, fork bombs, etc.), 50-iteration loop ceiling, NO_COLOR support
+- Tool result visibility: non-verbose mode shows result size; errors always shown with 200-char preview
+- Bash streaming via channel-based output with mpsc + 50ms polling loop
+- Edit tool: exact-match by default, `replace_all=true` for bulk changes, empty old_str creates/appends files
+
+**Architecture:**
+- `src/main.rs` — CLI, loop, error handling
+- `src/api.rs` — Anthropic client (reqwest + SSE)
+- `src/tools/mod.rs` — All 5 tools with `tools!` macro
+- Reference Go code at `/reference/go-source/` for pattern matching
+
+**Success criteria:** Binary compiles, tests pass, can chat/read/list/bash/edit/search, <950 lines, streaming visible, tool results respect size limits.
+
+---
+
+## 3. **tool-name-compliance.md** — PascalCase Renaming for OAuth Proxy
+
+**Goal:** Rename tool names to match Claude Code conventions so OAuth proxy validation succeeds.
+
+**Key finding:** Anthropic validates tool names against Claude Code's known set when OAuth credentials are injected. The tailnet OAuth proxy injects credentials for clients without their own API key. Requests with tools fail (400) unless names are PascalCase.
+
+**Naming changes:**
+- `read_file` → `Read`
+- `list_files` → `Glob`
+- `bash` → `Bash`
+- `edit_file` → `Edit`
+- `code_search` → `Grep`
+
+**Changes required:**
+1. Update `tools!` macro invocations in `tools/mod.rs`
+2. Update `dispatch_tool()` match arms
+3. Update `build_system_prompt()` references
+4. Update all tests and SSE test fixtures
+5. Update `AGENTS.md` documentation
+
+**Key note:** Only the `name` field changes. Descriptions, schemas, and internal function names (`bash_exec`, `read_exec`, etc.) stay the same. This is a pure wire-protocol rename.
+
+---
+
+## 4. **api-endpoint.md** — Configurable API Endpoint
+
+**Goal:** Route API requests through tailnet OAuth proxy by default, with optional override for direct API key access.
+
+**Key insight:** The common case is running on the tailnet where `anthropic-oauth-proxy.tailfb3ea.ts.net` handles auth via Claude Max subscription pooling. Direct API key auth is the escape hatch for off-tailnet use.
+
+**Architecture:**
+- `AnthropicClient` gains `api_url: String` (default: `https://anthropic-oauth-proxy.tailfb3ea.ts.net`) and `api_key: Option<String>` (optional, not required)
+- CLI `--api-url` argument with env var `ANTHROPIC_API_URL` and default fallback
+- Precedence: CLI arg > env var > default
+- `send_message()` constructs endpoint as `format!("{}/v1/messages", self.api_url)`
+- Conditionally attach `x-api-key` header only when `api_key.is_some()`
+- Always send `anthropic-version: 2023-06-01` header
+
+**Proxy compatibility:**
+- **Passthrough mode** (client provides API key): proxy forwards `x-api-key`, injects `anthropic-beta`
+- **OAuth pool mode** (no credentials): proxy strips client `Authorization`, injects Bearer token from pool, injects system prompt prefix for non-Haiku, handles 429 failover
+
+**Changes:**
+1. `api.rs` — `AnthropicClient` struct gains fields, `new()` accepts `api_url: &str`, `send_message()` uses `self.api_url`, remove `MissingApiKey` variant
+2. `main.rs` — `Cli` struct gains `--api-url`, pass to constructor
+
+**Success criteria:** `cargo run` works with zero env vars on tailnet; `ANTHROPIC_API_KEY=sk-... cargo run -- --api-url https://api.anthropic.com` works for direct access; SSE streaming identical through proxy.
+
+---
+
+## 5. **api-retry.md** — Transient Error Retry with Exponential Backoff
+
+**Goal:** Automatically retry transient API failures (429, 503, 529, network timeouts) instead of breaking the loop. Preserves existing error path for permanent failures.
+
+**Error classification:**
+- **Transient:** 429 rate limit, 503/529 overloaded, unknown 5xx; network timeouts/connection resets; SSE overload events (`overloaded_error`, `api_error`, `rate_limit_error`)
+- **Permanent:** 400 bad request, 401 auth, 403 forbidden, unknown 4xx (except 429); malformed JSON/SSE protocol violations; DNS/TLS errors
+
+**Retry strategy:**
+- Exponential backoff: 2s, 4s, 8s, 16s (4 retries max, 5 total attempts)
+- If HTTP `retry-after` header present: use its value instead (capped at 60s)
+- Max 4 retries after initial call
+- On permanent error: immediate `recover_conversation()` + break (no retry)
+- Error message displayed on every attempt
+
+**Changes:**
+1. `api.rs` — Split `AgentError` variants:
+   - `HttpError { status: u16, retry_after: Option<u64>, body: String }` for non-200 responses
+   - `StreamTransient(String)` for transient stream errors (overload events, connection drops, missing stop_reason)
+   - Keep `StreamParse(String)` for permanent parse failures
+   - Keep `Api(reqwest::Error)` — classify via `is_timeout()`/`is_connect()`
+   - Keep `Json(serde_json::Error)` — classify as permanent
+   - Add `classify_error(e: &AgentError) -> ErrorClass` enum with `Transient`/`Permanent`
+
+2. `main.rs` — Replace `match client.send_message()` block with retry loop wrapping the call. Retry logic lives in main.rs, not inside `send_message()`.
+
+**Logging:** `[retry] Attempt {n}/4: {status} — waiting {delay}s` and `[retry] Using retry-after: {n}s`
+
+**Non-goals:** Circuit breaker, jitter, stream parse retry, persistent state across outer loop, configurable parameters.
+
+---
+
+## 6. **session-capture.md** — JSONL Transcript Persistence
+
+**Goal:** Persist conversation transcripts in Entire-compatible JSONL format for post-session observability. Survive mid-session crashes via incremental writes.
+
+**Output structure:**
+```
+.entire/metadata/{session-id}/
+  ├── full.jsonl       # One JSON per line, append-only
+  ├── prompt.txt       # First user prompt
+  └── context.md       # Metadata + key actions
+```
+
+**Key requirements:**
+- Session ID: `{date}-{uuid}` format (e.g., `2026-02-10-a1b2c3d4...`)
+- Timestamps: UTC ISO 8601 on every turn
+- Token usage: parse from Anthropic API SSE `message_start`/`message_delta` events, attach to assistant turns as `message.usage` field
+- `send_message()` return signature changes: `(Vec<ContentBlock>, StopReason)` becomes `(Vec<ContentBlock>, StopReason, Usage)`
+- Write timing: append to JSONL after each complete turn (immediate, not buffered)
+- Write `prompt.txt` on first user input (survives crash)
+- Write `context.md` at session end (requires full history for key actions extraction)
+
+**JSONL format:**
+
+User turn:
+```json
+{"type":"user","sessionId":"2026-02-10-uuid","uuid":"turn-uuid","parentUuid":"prev-uuid","timestamp":"2026-02-10T23:31:00Z","cwd":"/path/to/project","version":"0.0.44","message":{"role":"user","content":"..."}}
+```
+
+Assistant turn:
+```json
+{"type":"assistant",...,"message":{"role":"assistant","content":[...],"usage":{"input_tokens":1200,"output_tokens":350,...}}}
+```
+
+**Token usage fields:** `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`
+
+**Key actions list:** Extract tool_use blocks from conversation history, emit `- **{tool_name}**: {first_arg_value}` per call.
+
+**Changes:**
+1. `api.rs` — Parse `usage` from SSE events, return as third element from `send_message()`
+2. `main.rs` — Generate session ID at startup, append JSONL after each turn, write files on first input/exit
+3. New: session transcript module with struct definitions, JSONL serialization, file I/O
+4. `Cargo.toml` — Add `uuid` (v4 feature) and `chrono` (or manual ISO 8601 formatting)
+
+**Success criteria:** JSONL written incrementally (survives crash), token usage parsed and attached, session ID date-uuid format, timestamps UTC ISO 8601, prompt.txt on first input, context.md with metadata+actions, existing `.entire/` state not modified, readable by `jq`.
+
+---
+
+## 7. **maxtoken-continuation.md** — Recover from MaxTokens Truncation
+
+**Goal:** When LLM response is cut off at max_tokens, inject a continuation prompt instead of breaking the loop. Recover mid-thought truncation without operator intervention.
+
+**Key distinction:**
+- Text-only truncation → continuable, inject "Continue from where you left off."
+- Tool_use truncation with valid tools → fall through to tool dispatch (those tools can execute)
+- Tool_use truncation with only null-input tools → empty after filtering, not continuable
+
+**Canonical control flow restructure:**
+
+```
+// 1. Break on EndTurn
+if stop_reason == EndTurn { break; }
+
+// 2. Handle MaxTokens
+if stop_reason == MaxTokens {
+  // filter null-input tool_use blocks
+  // inject placeholder if empty
+  
+  if is_empty { break; }  // API-level issue
+  
+  has_valid_tools = check for tool_use blocks after filtering;
+  
+  if has_valid_tools {
+    // fall through to tool dispatch
+  } else if continuation_count < 3 {
+    continuation_count += 1;
+    push User("Continue from where you left off.");
+    session.append_user_turn(...);  // log to JSONL
+    continue;  // loop back to API
+  } else {
+    // cap reached
+    break;
+  }
+}
+
+// 3. Tool dispatch (for both ToolUse and MaxTokens-with-valid-tools)
+```
+
+**Requirements:**
+- Track `continuation_count: usize` alongside `tool_iterations`
+- Cap at 3 continuations per inner loop session
+- Check for empty response AFTER filtering (only placeholder = break, don't continue)
+- Log each continuation: `[continue] Response truncated at max_tokens, requesting continuation ({n}/3)`
+- Inject "Continue from where you left off." as User message, log to JSONL via `session.append_user_turn()`
+- Do NOT increment `tool_iterations` on continuation (not a tool dispatch)
+- Reset `continuation_count` on new user input (outer loop)
+
+**Key note:** This is the ONE canonical restructure — do not implement differently. The `stop_reason` handling is: EndTurn → break, MaxTokens → branch, ToolUse → dispatch.
+
+**Success criteria:** Text-only MaxTokens triggers continuation, tool_use MaxTokens falls through to dispatch, continuation capped at 3, empty MaxTokens breaks immediately, continuation prompt logged to JSONL, existing MaxTokens filter tests pass.
+
+---
+
+## 8. **token-aware-trim.md** — Use API Token Counts for Context Trimming
+
+**Goal:** Use actual API token counts (`usage.input_tokens`) to gate context trimming instead of always running expensive byte serialization. Skip trim when context is well under the limit.
+
+**Key insight:** The 720KB byte budget is a conservative proxy for ~180K tokens (at 4 bytes/token). But the API returns exact token counts. When `input_tokens < 120K` (60% of 200K context), trim is unnecessary — skip the expensive operation. When `input_tokens >= 120K`, run trim.
+
+**Architecture:**
+- Track `last_input_tokens: u64` (from `usage.input_tokens` in each API response)
+- Initialize to 0 at start of each outer loop iteration
+- Before calling `trim_conversation()`:
+  - If `last_input_tokens == 0` (first call or usage absent): run byte trim (safety net)
+  - Else if `last_input_tokens < 120_000` (60% threshold): skip trim entirely
+  - Else (`last_input_tokens >= 120_000`): run byte trim
+
+**Constants:**
+- `MODEL_CONTEXT_TOKENS: u64 = 200_000` (Claude effective context)
+- `TRIM_THRESHOLD: u64 = 120_000` (60% of context window)
+- 60% threshold leaves 80K tokens of headroom for tool results added between calls
+
+**Why 60% not 80%:** At 80% threshold (160K), only 40K headroom remains. Large file reads (1MB) can exceed this, causing 400 context overflow before byte trim fires. 60% (120K) provides safer margin: 80K headroom covers 5 results at ~100KB each (typical tool batch).
+
+**Changes:**
+1. `main.rs` — Add `let mut last_input_tokens: u64 = 0;` declaration. After successful `send_message()`, update `last_input_tokens = usage.input_tokens`. Before `trim_conversation()` call, gate on `last_input_tokens`.
+
+**Success criteria:** First API call always trims (no token data), subsequent calls skip trim if under 120K, run trim if at/over 120K, byte trim fires correctly when triggered, token tracking persists across continuations, no behavioral change when usage absent, existing trim tests pass.
+
+---
+
+## 9. **tool-parallelism.md** — Concurrent Dispatch for Pure Tools
+
+**Goal:** Classify tools by side effects and execute read-only tools (Read, Glob, Grep) concurrently within a single tool batch to reduce wall-clock time.
+
+**Key classification:**
+- **Pure tools** (no side effects): Read, Glob, Grep → execute concurrently
+- **Mutating tools** (modify state): Bash, Edit → execute sequentially
+- **Batch logic:** If ALL tools in batch are Pure → concurrent. If ANY Mutating → entire batch sequential (conservative, correct).
+
+**Tool effect enum:**
+```rust
+pub enum ToolEffect { Pure, Mutating }
+pub fn tool_effect(name: &str) -> ToolEffect
+```
+
+**Concurrent dispatch architecture:**
+1. Classify entire batch
+2. If all Pure:
+   - Log each tool name before spawning
+   - For each tool: wrap in `tokio::task::spawn_blocking(dispatch_tool)`
+   - Use `futures_util::future::join_all()` to await concurrently
+   - Collect results in original order (preserve coherence)
+   - Per-tool error handling: failed Read doesn't cancel sibling Reads
+   - Use `None` guard inside each closure to preserve null-input handling
+   - Use no-op callback `&mut |_: &str| {}` inside closure (pure tools don't stream)
+3. If any Mutating:
+   - Sequential for-loop (existing code, unchanged)
+   - Bash streaming callback works as-is
+
+**Key requirements:**
+- `dispatch_tool()` remains sync (no async rewrite)
+- Wrap sync calls in `spawn_blocking` for true parallelism
+- Clone data for closure ownership: name, input, id
+- Order preservation: `join_all` returns results in same order as input futures
+- Tool name logging: collect `(String, ContentBlock)` tuples for post-dispatch logging
+- `JoinError` (thread panic) → valid ToolResult error with tool_use_id fallback
+- `tool_iterations += 1` increments after BOTH sequential and parallel paths
+- Pre-allocated slots for parallel path to preserve ordering (avoid merging after `join_all`)
+
+**Changes:**
+1. `tools/mod.rs` — Add `pub ToolEffect` enum and `pub fn tool_effect()` function
+2. `main.rs` — Before tool dispatch loop, classify batch. If all pure: `join_all` path. Else: sequential loop.
+
+**Success criteria:** 3 concurrent Reads faster than 3 sequential, mixed batch sequential, ordering preserved, individual errors don't cancel siblings, sequential tests pass, unknown tools default to Mutating, JoinError produces valid ToolResult, per-tool logging present in parallel path.
+
+---
+
+## 10. **hooks.md** — Shell-Based Hook Dispatch Layer
+
+**Goal:** Move Ralph loop guardrails inside forgeflare as a shell-based hook system with three lifecycle events (PreToolUse, PostToolUse, Stop) for structured observability and control.
+
+**Three hook events:**
+1. **PreToolUse** — guard before execution (allow/block), observe after guard (always runs, audit logging)
+2. **PostToolUse** — observe tool result, signal convergence to break inner loop
+3. **Stop** — finalization when loop ends (7 possible reasons)
+
+**Hook configuration:** TOML file at `.forgeflare/hooks.toml`
+
+```toml
+[[hooks]]
+event = "PreToolUse"
+phase = "guard"
+match_tool = "Bash"
+command = ".claude/hooks/ralph-guard.sh"
+timeout_ms = 5000
+
+[[hooks]]
+event = "PostToolUse"
+command = ".claude/hooks/convergence-check.sh"
+timeout_ms = 5000
+
+[[hooks]]
+event = "Stop"
+command = ".claude/hooks/session-end.sh"
+timeout_ms = 3000
+```
+
+**Hook contract:** JSON stdin, JSON stdout, stderr forwarded to forgeflare stderr.
+
+**PreToolUse input (guard phase):**
+```json
+{
+  "event": "PreToolUse",
+  "phase": "guard",
+  "tool": "Bash",
+  "input": {"command": "cargo test --release"},
+  "tool_iterations": 3,
+  "cwd": "/home/user/project"
+}
+```
+
+**PreToolUse output (guard phase only):**
+```json
+{"action": "allow"}
+{"action": "block", "reason": "..."}
+```
+
+**PreToolUse observe phase:** Always runs, even after block. Input includes `blocked: bool`, `blocked_by: String`, `block_reason: String` fields reflecting guard outcome.
+
+**PostToolUse input:**
+```json
+{
+  "event": "PostToolUse",
+  "tool": "Bash",
+  "input": {...},
+  "result": "test output (capped at 5KB with truncation marker if larger)",
+  "is_error": false,
+  "tool_iterations": 3,
+  "cwd": "/home/user/project"
+}
+```
+
+**PostToolUse output:**
+```json
+{"action": "continue"}
+{"action": "signal", "signal": "converged", "reason": "..."}
+```
+
+**Stop input:**
+```json
+{
+  "event": "Stop",
+  "reason": "end_turn" | "iteration_limit" | "api_error" | "continuation_cap" | "block_limit_consecutive" | "block_limit_total" | "convergence_signal",
+  "tool_iterations": 7,
+  "total_tokens": 45000,
+  "cwd": "/home/user/project"
+}
+```
+
+**Phase model for PreToolUse:**
+- **Guard phase** (fail-closed): can return allow/block. Run in declaration order. Block short-circuits remaining guards but NOT observe hooks. Timeout/crash/invalid JSON → Block.
+- **Observe phase** (fail-open): always runs with guard context. Return value ignored. Timeout/crash/bad JSON → logged, no effect.
+
+**Block counters:**
+- `consecutive_block_count: usize` — resets to 0 on successful tool dispatch, increments on PreToolUse block. Threshold: 3.
+- `total_block_count: usize` — never resets within inner loop, increments on block. Threshold: 10.
+- When either threshold hits: `conversation.pop()` (not `recover_conversation()`), break with `reason: "block_limit_consecutive"` or `"block_limit_total"`.
+
+**PostToolUse signal as control flow:**
+- When `run_post_tool_use` returns `Signal`: set `signal_break` flag
+- After current batch completes (all tool_results collected), send tool_results as User message, break without `recover_conversation()`
+- Stop hook fires with `reason: "convergence_signal"`
+
+**Convergence state protocol:**
+- File: `.forgeflare/convergence.json`
+- Structure:
+  ```json
+  {
+    "observations": [
+      {"signal": "clean_test", "reason": "...", "tool_iterations": 12},
+      {"signal": "stable_output", "reason": "...", "tool_iterations": 18}
+    ],
+    "final": {
+      "reason": "convergence_signal",
+      "tool_iterations": 22,
+      "total_tokens": 45000,
+      "timestamp": "2026-02-13T19:30:00Z"
+    }
+  }
+  ```
+- PostToolUse signals append to `observations` array (one append per hook returning Signal)
+- Stop hook writes `final` key (write-once)
+- Atomic writes: write to `.forgeflare/convergence.json.tmp`, then `fs::rename` (same directory for POSIX atomicity)
+- Forgeflare truncates stale convergence.json at startup (clean slate)
+
+**Dispatch wrapping (pseudocode):**
+
+Sequential path:
+```
+for each tool_use:
+  PreToolUse guard (async) → short-circuit on block
+  PreToolUse observe (async) → always runs
+  if blocked:
+    error result, increment block counters
+    if threshold hit: break
+    continue
+  dispatch_tool (sync)
+  reset consecutive_block_count = 0
+  PostToolUse (async)
+  if signal → set signal_break flag
+send tool_results
+if signal_break → break (no recover)
+```
+
+Parallel path (all-pure batch):
+```
+pre-allocate Vec<Option<ContentBlock>>
+for each tool_use (sequentially, before spawn):
+  PreToolUse guard (async) → short-circuit on block
+  PreToolUse observe (async) → always runs
+  if blocked:
+    fill slot with error, increment counters
+    if threshold hit: break
+  else:
+    reset consecutive_block_count
+    spawn_blocking(dispatch_tool)
+if threshold hit:
+  join_all already-spawned (avoid detaching)
+  break
+else:
+  join_all
+  fill slots
+  for each (slot, blocked):
+    if blocked → skip PostToolUse
+    PostToolUse (async)
+    if signal → set signal_break flag
+send tool_results
+if signal_break → break (no recover)
+```
+
+**HookRunner interface:**
+```rust
+pub struct HookRunner { hooks: Vec<HookConfig>, cwd: String }
+pub struct HookConfig { event, command, match_tool, phase, timeout_ms }
+
+pub enum PreToolResult { Allow, Block { reason, blocked_by } }
+pub enum PostToolResult { Continue, Signal { signal, reason } }
+
+impl HookRunner {
+  pub fn load(config_path: &str, cwd: &str) -> Self;
+  pub fn clear_convergence_state(&self);
+  pub async fn run_pre_tool_use(&self, tool, input, tool_iterations) -> PreToolResult;
+  pub async fn run_post_tool_use(&self, tool, input, result, is_error, tool_iterations) -> PostToolResult;
+  pub async fn run_stop(&self, reason, tool_iterations, total_tokens);
+}
+```
+
+**Changes:**
+1. New: `src/hooks.rs` — HookRunner, HookConfig, hook I/O types, subprocess execution, convergence state management (~250 LOC)
+2. `src/main.rs` — Initialize HookRunner at startup, delete stale convergence.json, wrap tool dispatch with PreToolUse/PostToolUse calls, add block counters and signal_break flag, call run_stop at loop exit (~60 LOC delta)
+3. `Cargo.toml` — add `toml` dependency
+
+**What does NOT change:**
+- `dispatch_tool` signature, tool exec functions, `tools!` macro, `ToolEffect` enum all unchanged
+- `api.rs` unchanged
+- `session.rs` unchanged
+
+**Success criteria:** Guard blocks with hook decision displayed, timeout/crash produces distinct error message, observe runs after guard with context, PostToolUse signal sets flag and breaks after batch, Stop fires with correct reason for all 7 conditions, block counters trigger break with `conversation.pop()`, convergence writes atomic, stale convergence.json deleted at startup, no matching hooks = no-op, dispatch_tool remains sync, parallel path block check per-tool before spawn, PreToolUse observe result truncated at 5KB, match_tool exact string only, sequential/parallel ordering preserved.
+
+---
+
+## 11. **release-workflow.md** — Cross-Platform GitHub Actions Release
+
+**Goal:** Publish release binaries via GitHub Actions triggered by version tags.
+
+**Trigger:** Version tag push (`v*`) — no manual dispatch.
+
+**Build matrix:**
+- `aarch64-apple-darwin` on `macos-latest`
+- `x86_64-unknown-linux-gnu` on `ubuntu-latest`
+
+**Per target:**
+- Run tests (`cargo test`)
+- Build release (`cargo build --release`)
+
+**Artifacts:**
+- Tarball per target: `forgeflare-{tag}-{target}.tar.gz`
+- Contents: `forgeflare` binary only
+- Compression: gzip
+
+**GitHub Release:**
+- Create release from tag
+- Attach both tarballs as assets
+- Title: tag name (e.g., `v0.0.43`)
+- Body: auto-generated changelog (`gh release create --generate-notes`)
+- Mark as latest
+
+**CI gate:** Release depends on existing CI passing (lint, audit, test, build).
+
+**Consistency:**
+- Pin action SHAs (like `ci.yml`)
+- Use `jdx/mise-action` for tools
+- Use `Swatinem/rust-cache` for caching
+- Least-privilege: `contents: write` on release job, `contents: read` on build jobs
+
+**No cross-compilation needed:** macOS aarch64 native on Apple Silicon, Linux x86_64 native on Ubuntu.
+
+**Success criteria:** Tag push triggers release, both binaries compile and test on target runners, tarballs attach to release, extracted binary works on target platform, CI gate blocks release on failure, action SHAs pinned.
+
+---
+
+## Implementation Order (Critical)
+
+1. `coding-agent.md` — Foundation
+2. `tool-name-compliance.md` — PascalCase renaming
+3. `api-endpoint.md` — Configurable endpoint
+4. `api-retry.md` — Transient retry loop
+5. `session-capture.md` — JSONL transcripts + usage return tuple
+6. `maxtoken-continuation.md` — Canonical control flow restructure
+7. `token-aware-trim.md` — Token-based trim gating
+8. `tool-parallelism.md` — Concurrent dispatch for pure tools
+9. `hooks.md` — Shell-based hook system wrapping dispatch
+10. `release-workflow.md` — GitHub Actions (independent of Rust code)
+
+This order avoids structural conflicts and ensures each spec's dependencies are satisfied before implementation.</result>
+<usage>total_tokens: 83460
+tool_uses: 12
+duration_ms: 101320</usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-dev-forge-forgeflare-hooks/tasks/ae80dfc.output
+
+---
+
+<task-notification>
+<task-id>a2b4352</task-id>
+<status>completed</status>
+<summary>Agent "Update IMPLEMENTATION_PLAN.md" completed</summary>
+<result>Perfect! I've successfully updated the implementation plan with all requested changes:
+
+## Summary of Changes to REDACTED.md
+
+1. **Marked items 1a-1f as DONE** - Changed all checkboxes from `- [ ]` to `- [x]` for the Foundation section (items 1a through 1f)
+
+2. **Marked items 2a-2c as DONE** - Changed all checkboxes from `- [ ]` to `- [x]` for the API Endpoint Configuration section (items 2a through 2c)
+
+3. **Updated header text** - Replaced the "Verified 2026-02-14: no code..." line with: "Updated 2026-02-14: Items 1 (Foundation) and 2 (API Endpoint Configuration) are complete. 33 tests pass, clippy clean, fmt clean. Binary compiles and all 5 tools work with PascalCase names."
+
+4. **Added Learnings section** - Added a new "## Learnings" section at the bottom of the file with all six technical notes about:
+   - `futures_util::stream::once` vs `stream::iter` for test mocks
+   - SSE data JSON escaping requirements
+   - Grep test isolation using temp directories
+   - `std::io::IsTerminal` trait vs FFI `isatty`
+   - `bytes` crate as explicit dependency
+   - reqwest `json` feature requirement
+
+The file now accurately reflects the current state of the project with items 1 and 2 completed and captures important implementation learnings for future reference.</result>
+<usage>total_tokens: 28216
+tool_uses: 5
+duration_ms: 92870</usage>
+</task-notification>
+Full transcript available at: REDACTED.output
+
+---
+
+<task-notification>
+<task-id>a1eadbe</task-id>
+<status>completed</status>
+<summary>Agent "Update IMPLEMENTATION_PLAN item 3" completed</summary>
+<result>Perfect! I've successfully updated `REDACTED.md` with the requested changes:
+
+## Changes Applied
+
+1. **Marked items 3a, 3b, and 3c as DONE** - Changed all three checkboxes from `- [ ]` to `- [x]` for the API Retry spec items (error classification, retry loop, and tests).
+
+2. **Added two new learnings to the Learnings section**:
+   - A note about clippy's `needless_range_loop` lint and when to use `#[allow]` for intentional range-vs-array mismatches (the initial call + retries pattern)
+   - An observation that the `AgentError` variants designed in item 1 already matched the retry spec's error classification needs, demonstrating the value of designing error types early
+
+The file now correctly reflects the completion of the API Retry implementation (item 3) and captures the lessons learned during that implementation phase.</result>
+<usage>total_tokens: 25882
+tool_uses: 3
+duration_ms: 47457</usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-dev-forge-forgeflare-hooks/tasks/a1eadbe.output

@@ -1,0 +1,38 @@
+{
+  "cli_version": "0.5.0",
+  "checkpoint_id": "b1d2ae599ac6",
+  "session_id": "66bba141-54cc-45e0-9eec-469c609f81a4",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-08T23:22:56.696179Z",
+  "branch": "claude/repo-review-analysis-8P7Pe",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "docs/reviews/02-code-quality.md",
+    "docs/reviews/00-executive-summary.md",
+    "docs/reviews/03-feature-gaps.md",
+    "docs/reviews/01-security-audit.md",
+    "docs/reviews/04-code-simplification.md"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6",
+  "turn_id": "d54745f6da04",
+  "token_usage": {
+    "input_tokens": 21,
+    "cache_creation_tokens": 167289,
+    "cache_read_tokens": 1212974,
+    "output_tokens": 7861,
+    "api_call_count": 18
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-08T23:22:56.529568Z",
+    "agent_lines": 1528,
+    "human_added": 1,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1529,
+    "agent_percentage": 99.9345977763244
+  }
+}

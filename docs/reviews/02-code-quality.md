@@ -2,13 +2,14 @@
 
 **Reviewer**: Automated Code Quality Agent
 **Date**: 2026-02-26
+**Commit**: `71a91c2`
 **Scope**: All source files, CI/CD, specs, and tests
 
 ---
 
 ## Executive Summary
 
-The ForgeFlare codebase is well-structured for a ~4,900 LOC Rust project. It follows its specs closely, has good test coverage (60+ tests), and demonstrates solid Rust idioms overall. The error handling is deliberate, the hook system correctly implements fail-closed/fail-open semantics, and the SSE parser is robust. The findings below range from a few critical issues to numerous suggestions for hardening.
+The ForgeFlare codebase is well-structured for a ~4,900 LOC Rust project. It follows its specs closely, has good test coverage (119 tests), and demonstrates solid Rust idioms overall. The error handling is deliberate, the hook system correctly implements fail-closed/fail-open semantics, and the SSE parser is robust. The findings below range from a few critical issues to numerous suggestions for hardening.
 
 ---
 
@@ -302,7 +303,7 @@ No integration tests exercise the full `run_turn` function with a mock API serve
 **Strengths:**
 - Clean separation of concerns across 5 modules with well-defined boundaries
 - Excellent error handling strategy: `thiserror` for structured errors, fail-closed guards, fail-open observers
-- Strong test coverage (60+ tests) covering unit, integration, and edge cases
+- Strong test coverage (119 tests) covering unit, integration, and edge cases
 - SSE parser well-tested with 6 distinct scenarios
 - Atomic convergence writes with same-directory temp+rename pattern
 - Good use of `serde` with `skip_serializing_if` and `rename` for API wire compatibility

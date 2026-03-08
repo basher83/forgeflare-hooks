@@ -2,6 +2,7 @@
 
 **Auditor**: Automated Security Review Agent
 **Date**: 2026-02-26
+**Commit**: `71a91c2`
 **Scope**: Full source tree at `/home/user/forgeflare-hooks`
 **Codebase**: Rust single-binary coding agent with shell hook system
 

@@ -2,19 +2,20 @@
 
 **Analyst**: Automated Feature Gaps Agent
 **Date**: 2026-02-26
+**Commit**: `71a91c2`
 **Scope**: Full codebase, specs, and adjacent configuration
 
 ---
 
 ## Executive Summary
 
-ForgeFlare is a well-structured coding agent wrapping the Claude API with streaming SSE, 5 tools (Read, Glob, Bash, Edit, Grep), a shell-based hook system, session transcript capture, and convergence tracking. All 9 specs in `specs/` are fully implemented. The codebase is clean, well-tested (119 tests), and under 5,000 total lines across 5 source files. This analysis identifies 42 opportunities across 10 categories.
+ForgeFlare is a well-structured coding agent wrapping the Claude API with streaming SSE, 5 tools (Read, Glob, Bash, Edit, Grep), a shell-based hook system, session transcript capture, and convergence tracking. All 10 specs in `specs/` are fully implemented. The codebase is clean, well-tested (119 tests), and under 5,000 total lines across 5 source files. This analysis identifies 42 opportunities across 10 categories.
 
 ---
 
 ## 1. Planned but Unimplemented Features
 
-All 9 specs are fully implemented. However, several features are referenced in adjacent files but have no specs or implementation:
+All 10 specs are fully implemented. However, several features are referenced in adjacent files but have no specs or implementation:
 
 ### 1.1 Subagent Dispatch
 

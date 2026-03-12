@@ -1,0 +1,30 @@
+{
+  "cli_version": "0.5.0",
+  "checkpoint_id": "94b906c58350",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "IMPLEMENTATION_PLAN.md",
+    "specs/glob-shell-injection.md",
+    "src/hooks.rs",
+    "src/main.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/94/b906c58350/0/metadata.json",
+      "transcript": "/94/b906c58350/0/full.jsonl",
+      "content_hash": "/94/b906c58350/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 0
+  }
+}

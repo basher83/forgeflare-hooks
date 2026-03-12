@@ -331,13 +331,15 @@ where
                                     .as_str()
                                     .unwrap_or("unknown error");
                                 match err_type {
-                                    "overloaded_error" | "api_error" | "rate_limit_error" => {
-                                        return Err(AgentError::StreamTransient(format!(
+                                    "invalid_request_error" => {
+                                        return Err(AgentError::StreamParse(format!(
                                             "{err_type}: {err_msg}"
                                         )));
                                     }
                                     _ => {
-                                        return Err(AgentError::StreamParse(format!(
+                                        // Unknown/absent error types default to transient —
+                                        // server-side errors are usually temporary (spec R1).
+                                        return Err(AgentError::StreamTransient(format!(
                                             "{err_type}: {err_msg}"
                                         )));
                                     }
@@ -510,6 +512,25 @@ mod tests {
 
         let err = parse_sse_stream(stream, &mut |_| {}).await.unwrap_err();
         assert!(matches!(err, AgentError::StreamParse(_)));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_unknown_error_type_is_transient() {
+        // Unknown error types from the API should be transient (retryable),
+        // not permanent — server-side errors are usually temporary.
+        let sse_data = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"some_future_error\",\"message\":\"Something new\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let err = parse_sse_stream(stream, &mut |_| {}).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::StreamTransient(_)),
+            "unknown error type should be transient, got: {err}"
+        );
     }
 
     #[tokio::test]

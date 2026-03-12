@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.5.0",
+  "checkpoint_id": "94b906c58350",
+  "session_id": "6e34ed71-5bb6-4b1f-b6cf-6e576101c36d",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-12T05:28:07.132103Z",
+  "branch": "main",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "IMPLEMENTATION_PLAN.md",
+    "specs/glob-shell-injection.md",
+    "src/hooks.rs",
+    "src/main.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "cf854fd7b2b9",
+  "checkpoint_transcript_start": 151,
+  "transcript_lines_at_start": 151,
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 0
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-12T05:28:06.593794Z",
+    "agent_lines": 96,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 96,
+    "agent_percentage": 100
+  }
+}

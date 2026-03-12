@@ -25,6 +25,12 @@
       "transcript": "/bb/45607c53ae/2/full.jsonl",
       "content_hash": "/bb/45607c53ae/2/content_hash.txt",
       "prompt": "/bb/45607c53ae/2/prompt.txt"
+    },
+    {
+      "metadata": "/bb/45607c53ae/3/metadata.json",
+      "transcript": "/bb/45607c53ae/3/full.jsonl",
+      "content_hash": "/bb/45607c53ae/3/content_hash.txt",
+      "prompt": ""
     }
   ],
   "token_usage": {

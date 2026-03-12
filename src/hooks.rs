@@ -1152,6 +1152,51 @@ timeout_ms = 5000
     }
 
     #[tokio::test]
+    async fn stop_unrecognized_action_does_not_panic() {
+        // hooks.md R3: "Unrecognized action values in Stop output are logged
+        // and treated as continue." This verifies a Stop hook returning an
+        // unknown action (e.g., "signal") is absorbed without panic, and the
+        // convergence final state is still written correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let hook_script = dir.path().join("weird_stop.sh");
+        fs::write(
+            &hook_script,
+            "#!/bin/bash\necho '{\"action\":\"signal\"}'\n",
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let config_path = dir.path().join("hooks.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[[hooks]]\nevent = \"Stop\"\ncommand = \"{}\"\n",
+                hook_script.display()
+            ),
+        )
+        .unwrap();
+
+        let runner = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
+        // Should not panic — unrecognized action is logged and ignored
+        runner.run_stop("end_turn", 5, 20000).await;
+
+        // Convergence final state should still be written despite unrecognized action
+        let conv_path = dir.path().join(".forgeflare/convergence.json");
+        let conv = fs::read_to_string(&conv_path).unwrap();
+        let state: ConvergenceState = serde_json::from_str(&conv).unwrap();
+        assert!(state.final_state.is_some());
+        let final_s = state.final_state.unwrap();
+        assert_eq!(final_s.reason, "end_turn");
+        assert_eq!(final_s.tool_iterations, 5);
+        assert_eq!(final_s.total_tokens, 20000);
+    }
+
+    #[tokio::test]
     async fn no_matching_hooks_returns_allow() {
         let dir = tempfile::tempdir().unwrap();
         let hook_script = dir.path().join("guard.sh");
@@ -1388,6 +1433,38 @@ timeout_ms = 5000
         // When filtering guard hooks, None is treated as "guard"
         let phase = hook.phase.as_deref().unwrap_or("guard");
         assert_eq!(phase, "guard");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn convergence_write_failure_is_not_fatal() {
+        // hooks.md R8: convergence write failures are logged as warnings and
+        // do not affect PostToolUse return value. Verify that write_observations
+        // returns Err (not panic) when the directory is read-only.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ff_dir = dir.path().join(".forgeflare");
+        fs::create_dir_all(&ff_dir).unwrap();
+        // Make the directory read-only so writes fail
+        fs::set_permissions(&ff_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let conv_path = ff_dir.join("convergence.json");
+        let conv_tmp = ff_dir.join("convergence.json.tmp");
+
+        let observations = vec![Observation {
+            signal: "test".to_string(),
+            reason: "test reason".to_string(),
+            tool_iterations: 1,
+        }];
+
+        let result = write_observations(&observations, &ff_dir, &conv_path, &conv_tmp);
+        // Restore permissions before assertions so tempdir cleanup works
+        fs::set_permissions(&ff_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "write to read-only dir should return Err, not panic"
+        );
     }
 
     #[tokio::test]

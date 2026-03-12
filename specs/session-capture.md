@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # Session Transcript Persistence Specification
 
-**Status:** Active
 **Target:** Persist conversation transcripts to disk in Entire-compatible JSONL format for post-session observability
 
 ---

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Generate `all_tool_schemas()` from a declarative tool list.
@@ -281,6 +281,10 @@ fn is_denied_command(cmd: &str) -> bool {
         .any(|pattern| normalized.contains(pattern))
 }
 
+/// Maximum output size for bash commands (1MB). Commands that exceed this are
+/// killed to prevent unbounded memory growth from runaway processes.
+const BASH_OUTPUT_LIMIT: usize = 1_048_576;
+
 fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, String> {
     let command = input["command"]
         .as_str()
@@ -350,6 +354,7 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
     // Drop our copy of tx so rx closes when threads finish
     let mut output = String::new();
     let mut timed_out = false;
+    let mut truncated = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -361,6 +366,13 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
                 stream_cb(&chunk);
+                if output.len() + chunk.len() > BASH_OUTPUT_LIMIT {
+                    let remaining = BASH_OUTPUT_LIMIT.saturating_sub(output.len());
+                    output.push_str(&chunk[..chunk.floor_char_boundary(remaining)]);
+                    let _ = child.kill();
+                    truncated = true;
+                    break;
+                }
                 output.push_str(&chunk);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -370,7 +382,13 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
                         // Process finished — drain remaining
                         while let Ok(chunk) = rx.try_recv() {
                             stream_cb(&chunk);
-                            output.push_str(&chunk);
+                            if output.len() + chunk.len() <= BASH_OUTPUT_LIMIT {
+                                output.push_str(&chunk);
+                            } else if !truncated {
+                                let remaining = BASH_OUTPUT_LIMIT.saturating_sub(output.len());
+                                output.push_str(&chunk[..chunk.floor_char_boundary(remaining)]);
+                                truncated = true;
+                            }
                         }
                         break;
                     }
@@ -384,6 +402,13 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
                 break;
             }
         }
+    }
+
+    if truncated {
+        let _ = child.wait();
+        return Err(format!(
+            "Command output exceeded 1MB limit (truncated):\n{output}"
+        ));
     }
 
     if timed_out {
@@ -425,9 +450,19 @@ fn edit_exec(input: &Value) -> Result<String, String> {
 
     let path = Path::new(file_path);
 
+    const EDIT_SIZE_LIMIT: u64 = 102_400;
+
     // Empty old_str: create file (if missing) or append (if exists)
     if old_str.is_empty() {
         if path.exists() {
+            let metadata =
+                std::fs::metadata(path).map_err(|e| format!("Cannot read metadata: {e}"))?;
+            if metadata.len() > EDIT_SIZE_LIMIT {
+                return Err(format!(
+                    "File too large for edit: {} bytes (limit: 100KB)",
+                    metadata.len()
+                ));
+            }
             // Append
             let mut content =
                 std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
@@ -435,6 +470,12 @@ fn edit_exec(input: &Value) -> Result<String, String> {
             std::fs::write(path, &content).map_err(|e| format!("Cannot write file: {e}"))?;
             return Ok(format!("Appended to {file_path}"));
         } else {
+            if new_str.len() as u64 > EDIT_SIZE_LIMIT {
+                return Err(format!(
+                    "Content too large for create: {} bytes (limit: 100KB)",
+                    new_str.len()
+                ));
+            }
             // Create with parent dirs
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
@@ -449,7 +490,7 @@ fn edit_exec(input: &Value) -> Result<String, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
 
     let metadata = std::fs::metadata(path).map_err(|e| format!("Cannot read metadata: {e}"))?;
-    if metadata.len() > 102_400 {
+    if metadata.len() > EDIT_SIZE_LIMIT {
         return Err(format!(
             "File too large for edit: {} bytes (limit: 100KB)",
             metadata.len()
@@ -491,22 +532,20 @@ fn grep_exec(input: &Value) -> Result<String, String> {
     let file_type = input["file_type"].as_str();
     let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(true);
 
-    // Check rg is installed
-    let rg_check = Command::new("which").arg("rg").output();
-    match rg_check {
-        Ok(output) if !output.status.success() => {
-            return Err(
-                "ripgrep (rg) is not installed. Install it with: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
-                    .to_string(),
-            );
-        }
-        Err(_) => {
-            return Err(
-                "ripgrep (rg) is not installed. Install it with: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
-                    .to_string(),
-            );
-        }
-        _ => {}
+    // Check rg is installed (cached — runs `which` once per process)
+    static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    let rg_ok = *RG_AVAILABLE.get_or_init(|| {
+        Command::new("which")
+            .arg("rg")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+    if !rg_ok {
+        return Err(
+            "ripgrep (rg) is not installed. Install it with: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
+                .to_string(),
+        );
     }
 
     let mut cmd = Command::new("rg");
@@ -938,5 +977,106 @@ mod tests {
                 _ => panic!("New tool {name} needs explicit ToolEffect classification"),
             }
         }
+    }
+
+    // --- bash_exec output cap tests ---
+
+    #[test]
+    fn bash_output_cap_constant_is_1mb() {
+        assert_eq!(BASH_OUTPUT_LIMIT, 1_048_576);
+    }
+
+    #[test]
+    fn bash_large_output_is_truncated() {
+        // Generate ~2MB of output — exceeds the 1MB cap.
+        // Use yes piped through head to produce enough repeated lines.
+        let result = dispatch_tool(
+            "Bash",
+            &json!({"command": "yes 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' | head -c 2097152"}),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "should return Err on output cap");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("1MB limit"),
+            "error should mention 1MB limit: {}",
+            &err[..err.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn bash_normal_output_not_truncated() {
+        // Small output should pass through fine
+        let result = dispatch_tool("Bash", &json!({"command": "echo hello"}), &mut |_| {});
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().trim(), "hello");
+    }
+
+    // --- Edit size limit tests (create/append paths) ---
+
+    #[test]
+    fn edit_append_rejects_oversized_file() {
+        let dir = std::env::temp_dir().join("forgeflare_test_edit");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test_oversized_append.txt");
+        // Create a file larger than 100KB
+        let big = "x".repeat(110_000);
+        std::fs::write(&file, &big).unwrap();
+
+        let result = dispatch_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_str": "",
+                "new_str": "more data",
+            }),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "should reject append to oversized file");
+        assert!(result.unwrap_err().contains("too large"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn edit_create_rejects_oversized_content() {
+        let dir = std::env::temp_dir().join("forgeflare_test_edit");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test_oversized_create.txt");
+        let _ = std::fs::remove_file(&file);
+
+        let big_content = "x".repeat(110_000);
+        let result = dispatch_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_str": "",
+                "new_str": big_content,
+            }),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "should reject oversized create");
+        assert!(result.unwrap_err().contains("too large"));
+        // File should not have been created
+        assert!(!file.exists());
+    }
+
+    // --- grep rg cache test ---
+
+    #[test]
+    fn grep_rg_cache_is_consistent() {
+        // Call grep twice — both should succeed (rg is installed on this system)
+        // and the OnceLock should be initialized on first call, reused on second
+        let r1 = dispatch_tool(
+            "Grep",
+            &json!({"pattern": "fn main", "path": "src/main.rs"}),
+            &mut |_| {},
+        );
+        let r2 = dispatch_tool(
+            "Grep",
+            &json!({"pattern": "fn main", "path": "src/main.rs"}),
+            &mut |_| {},
+        );
+        assert!(r1.is_ok(), "first grep should succeed");
+        assert!(r2.is_ok(), "second grep should succeed");
     }
 }

@@ -1,12 +1,13 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. 157 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. 163 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
 Updated 2026-03-11: Phase 2 item 2 (SSE Buffer Optimization) complete. Replaced two `.to_string()` allocations with slice borrow + `drain()` in `parse_sse_stream`. All 6 SSE parser tests pass unchanged.
 Updated 2026-03-12: Phase 2 item 4 (Project Instructions Loading) complete. InstructionsResult enum, load_project_instructions() function, wired into main() with verbose/warn logging, 11 new tests (CLAUDE.md load, AGENTS.md fallback, priority, symlinks, oversized skip, unreadable skip, both skipped, prompt format, signature unchanged). All 151 tests pass, clippy clean, fmt clean.
 Updated 2026-03-12: Pre-existing bugs 3 and 4 fixed (v0.0.13). Bug 3: malformed tool input JSON now sets input to Null (was silently left as `{}`) with stderr error log; downstream null-input check produces clean error ToolResult. Bug 4: recover_conversation now guards `messages.len() > 1` before each pop, preventing conversation from being emptied. 4 new tests. All 157 tests pass, clippy clean, fmt clean.
+Updated 2026-03-12: Tool hardening (v0.0.14). Three fixes in `src/tools/mod.rs`: (1) bash_exec 1MB output cap — kills process and returns truncated output on overflow, preventing OOM from runaway commands; (2) edit_exec 100KB size check now applies to create/append paths (was only on replace); (3) grep_exec `which rg` check cached via `OnceLock` — one subprocess per process instead of per call. 6 new tests. All 163 tests pass, clippy clean, fmt clean.
 
 ## Phase 2 — Active (ordered by priority)
 
@@ -108,9 +109,9 @@ These are NOT Phase 2 spec items but bugs found during audit:
 - `tool_effect` function name in code vs `classify_effect` in CLAUDE.md (naming mismatch, cosmetic)
 - `MAX_CONTINUATIONS` constant defined at `main.rs:790`, separated from other constants at lines 15-23
 - `stop_reason_str` is stringly-typed (`&str`) where the rest of the codebase uses typed enums
-- `which rg` check in `grep_exec` re-runs on every Grep call (no caching)
-- Edit 100KB size limit only applies to the replace path, not create/append
-- `bash_exec` has no output size cap (unbounded accumulation until 120s timeout)
+- ~~`which rg` check in `grep_exec` re-runs on every Grep call (no caching)~~ Fixed v0.0.14: cached via `OnceLock`
+- ~~Edit 100KB size limit only applies to the replace path, not create/append~~ Fixed v0.0.14: size check now covers all paths
+- ~~`bash_exec` has no output size cap (unbounded accumulation until 120s timeout)~~ Fixed v0.0.14: 1MB cap with process kill
 - Bash schema declares `description` parameter that is never read by `bash_exec`
 
 ## Learnings
@@ -143,3 +144,6 @@ These are NOT Phase 2 spec items but bugs found during audit:
 - The `glob` crate's `glob()` uses `MatchOptions::new()` (case_sensitive: true) while `Default::default()` sets case_sensitive: false — use `glob()` not `glob_with(_, MatchOptions::default())` to match bash behavior
 - The `glob` crate does not support brace expansion — implement `expand_braces()` preprocessor for `{a,b}` patterns before calling `glob::glob()`
 - Tests using `set_current_dir` must be serialized with a static `Mutex<()>` — cargo test runs tests in parallel within the same process, and cwd is process-global state. The `with_temp_cwd` helper pattern (lock → save original → set temp cwd → run closure → restore original) prevents races.
+- `std::sync::OnceLock` (Rust 1.70+) is ideal for caching one-time subprocess checks — thread-safe lazy initialization without external dependencies
+- `str::floor_char_boundary()` (Rust 1.73+) safely truncates strings at char boundaries — avoids panics when slicing multi-byte UTF-8 in output cap logic
+- Bash deny list matches on normalized (lowercased, whitespace-collapsed) command strings — test commands for output cap must avoid matching deny patterns (e.g. `dd if=/dev` triggers the deny list)

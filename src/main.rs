@@ -22,6 +22,7 @@ const TRIM_THRESHOLD: u64 = MODEL_CONTEXT_TOKENS * 60 / 100; // 120K tokens
 const MAX_CONSECUTIVE_BLOCKS: usize = 3;
 const MAX_TOTAL_BLOCKS: usize = 10;
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 32_768;
+const MAX_CONTINUATIONS: usize = 3;
 
 #[derive(Debug, PartialEq)]
 enum InstructionsResult {
@@ -243,6 +244,32 @@ enum PreDispatchResult {
     ThresholdTripped,
 }
 
+/// Why a turn ended. Passed to the Stop hook as the `"reason"` field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TurnStopReason {
+    EndTurn,
+    IterationLimit,
+    ApiError,
+    ContinuationCap,
+    BlockLimitConsecutive,
+    BlockLimitTotal,
+    ConvergenceSignal,
+}
+
+impl TurnStopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            TurnStopReason::EndTurn => "end_turn",
+            TurnStopReason::IterationLimit => "iteration_limit",
+            TurnStopReason::ApiError => "api_error",
+            TurnStopReason::ContinuationCap => "continuation_cap",
+            TurnStopReason::BlockLimitConsecutive => "block_limit_consecutive",
+            TurnStopReason::BlockLimitTotal => "block_limit_total",
+            TurnStopReason::ConvergenceSignal => "convergence_signal",
+        }
+    }
+}
+
 /// Unified pre-dispatch protocol for both parallel and sequential paths.
 /// Checks null-input, runs pre-hook, manages block counting and threshold checks.
 /// Block counts are mutated in place so callers cannot forget to apply them.
@@ -322,11 +349,11 @@ fn log_tool_dispatch(name: &str, input: &serde_json::Value, verbose: bool) {
     }
 }
 
-fn threshold_reason_str(consecutive_block_count: usize) -> &'static str {
+fn threshold_stop_reason(consecutive_block_count: usize) -> TurnStopReason {
     if consecutive_block_count >= MAX_CONSECUTIVE_BLOCKS {
-        "block_limit_consecutive"
+        TurnStopReason::BlockLimitConsecutive
     } else {
-        "block_limit_total"
+        TurnStopReason::BlockLimitTotal
     }
 }
 
@@ -546,14 +573,14 @@ async fn run_turn(
     let mut consecutive_block_count: usize = 0;
     let mut total_block_count: usize = 0;
     let mut total_tokens: u64 = 0;
-    let mut stop_reason_str = "end_turn";
+    let mut turn_stop_reason = TurnStopReason::EndTurn;
     loop {
         trim_if_needed(conversation, last_input_tokens);
 
         if tool_iterations >= MAX_TOOL_ITERATIONS {
             eprintln!("[warn] Tool iteration limit ({MAX_TOOL_ITERATIONS}) reached");
             recover_conversation(conversation);
-            stop_reason_str = "iteration_limit";
+            turn_stop_reason = TurnStopReason::IterationLimit;
             break;
         }
 
@@ -584,13 +611,13 @@ async fn run_turn(
                     eprintln!("\n[error] API call failed: {e}");
                     if classify_error(&e) == ErrorClass::Permanent {
                         recover_conversation(conversation);
-                        stop_reason_str = "api_error";
+                        turn_stop_reason = TurnStopReason::ApiError;
                         break;
                     }
                     if attempt >= MAX_RETRIES {
                         eprintln!("[retry] Max retries ({MAX_RETRIES}) exhausted");
                         recover_conversation(conversation);
-                        stop_reason_str = "api_error";
+                        turn_stop_reason = TurnStopReason::ApiError;
                         break;
                     }
                     let delay = if let AgentError::HttpError {
@@ -649,7 +676,7 @@ async fn run_turn(
         // EndTurn — normal completion
         if stop_reason == StopReason::EndTurn {
             println!();
-            stop_reason_str = "end_turn";
+            turn_stop_reason = TurnStopReason::EndTurn;
             break;
         }
 
@@ -660,7 +687,7 @@ async fn run_turn(
             match classify_max_tokens(&blocks, continuation_count) {
                 MaxTokensAction::BreakEmpty => {
                     eprintln!("[info] Empty response at max_tokens, breaking");
-                    stop_reason_str = "continuation_cap";
+                    turn_stop_reason = TurnStopReason::ContinuationCap;
                     break;
                 }
                 MaxTokensAction::DispatchTools => {} // Fall through to tool dispatch
@@ -682,7 +709,7 @@ async fn run_turn(
                 }
                 MaxTokensAction::BreakCapReached => {
                     eprintln!("[continue] Max continuations reached, breaking");
-                    stop_reason_str = "continuation_cap";
+                    turn_stop_reason = TurnStopReason::ContinuationCap;
                     break;
                 }
             }
@@ -705,7 +732,7 @@ async fn run_turn(
 
         let mut signal_break = false;
         let mut threshold_tripped = false;
-        let mut threshold_reason = "";
+        let mut threshold_reason = TurnStopReason::EndTurn; // placeholder, only used when threshold_tripped
         let tool_results: Vec<ContentBlock> = if all_pure {
             // Parallel path: all tools are pure (Read, Glob, Grep)
             let batch_size = tool_uses.len();
@@ -741,7 +768,7 @@ async fn run_turn(
                     }
                     PreDispatchResult::ThresholdTripped => {
                         threshold_tripped = true;
-                        threshold_reason = threshold_reason_str(consecutive_block_count);
+                        threshold_reason = threshold_stop_reason(consecutive_block_count);
                         break;
                     }
                 }
@@ -802,7 +829,7 @@ async fn run_turn(
                     }
                     PreDispatchResult::ThresholdTripped => {
                         threshold_tripped = true;
-                        threshold_reason = threshold_reason_str(consecutive_block_count);
+                        threshold_reason = threshold_stop_reason(consecutive_block_count);
                         break;
                     }
                 }
@@ -846,7 +873,7 @@ async fn run_turn(
         // Block threshold takes precedence over signal_break
         if threshold_tripped {
             conversation.pop();
-            stop_reason_str = threshold_reason;
+            turn_stop_reason = threshold_reason;
             break;
         }
         if tool_results.is_empty() {
@@ -860,13 +887,13 @@ async fn run_turn(
         session.append_user_turn(&tool_msg);
         tool_iterations += 1;
         if signal_break {
-            stop_reason_str = "convergence_signal";
+            turn_stop_reason = TurnStopReason::ConvergenceSignal;
             break;
         }
     }
 
     hooks
-        .run_stop(stop_reason_str, tool_iterations, total_tokens)
+        .run_stop(turn_stop_reason.as_str(), tool_iterations, total_tokens)
         .await;
 }
 
@@ -878,8 +905,6 @@ fn truncate_json(value: &serde_json::Value, max_len: usize) -> String {
         format!("{}...", &s[..s.floor_char_boundary(max_len)])
     }
 }
-
-const MAX_CONTINUATIONS: usize = 3;
 
 /// Determine what to do after a MaxTokens stop_reason.
 /// Returns the action to take given the filtered content blocks and current continuation count.

@@ -39,9 +39,10 @@ Full line-by-line audit of all specs against implementation. Results:
 
 ## Minor Code Observations (not blocking)
 
-- `tool_effect` function name in code vs `classify_effect` in CLAUDE.md (naming mismatch, cosmetic)
-- `MAX_CONTINUATIONS` constant defined at `main.rs:882`, separated from other constants at lines 15-23
-- `stop_reason_str` is stringly-typed (`&str`) where the rest of the codebase uses typed enums
+All resolved in v0.0.18:
+- `classify_effect` naming mismatch — stale note, CLAUDE.md does not reference this name.
+- `MAX_CONTINUATIONS` constant moved to top-of-file constants block.
+- `stop_reason_str` replaced with typed `TurnStopReason` enum.
 
 ## Learnings
 

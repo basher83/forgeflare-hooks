@@ -534,6 +534,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_sse_absent_error_type_is_transient() {
+        // api-retry R1: when the SSE error object exists but has no `type` field,
+        // it should default to transient (retryable). The code uses
+        // `unwrap_or("unknown")` which falls through to the `_` arm.
+        let sse_data = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"Something went wrong\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let err = parse_sse_stream(stream, &mut |_| {}).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::StreamTransient(_)),
+            "absent error.type should be transient, got: {err}"
+        );
+        // Verify the error message contains "unknown" (the default type)
+        if let AgentError::StreamTransient(msg) = &err {
+            assert!(
+                msg.contains("unknown"),
+                "error message should contain 'unknown' type: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn parse_sse_missing_stop_reason() {
         let sse_data = concat!(
             "event: content_block_start\n",

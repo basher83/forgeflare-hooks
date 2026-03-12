@@ -1435,6 +1435,38 @@ timeout_ms = 5000
         assert_eq!(phase, "guard");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn convergence_write_failure_is_not_fatal() {
+        // hooks.md R8: convergence write failures are logged as warnings and
+        // do not affect PostToolUse return value. Verify that write_observations
+        // returns Err (not panic) when the directory is read-only.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ff_dir = dir.path().join(".forgeflare");
+        fs::create_dir_all(&ff_dir).unwrap();
+        // Make the directory read-only so writes fail
+        fs::set_permissions(&ff_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let conv_path = ff_dir.join("convergence.json");
+        let conv_tmp = ff_dir.join("convergence.json.tmp");
+
+        let observations = vec![Observation {
+            signal: "test".to_string(),
+            reason: "test reason".to_string(),
+            tool_iterations: 1,
+        }];
+
+        let result = write_observations(&observations, &ff_dir, &conv_path, &conv_tmp);
+        // Restore permissions before assertions so tempdir cleanup works
+        fs::set_permissions(&ff_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "write to read-only dir should return Err, not panic"
+        );
+    }
+
     #[tokio::test]
     async fn stop_seven_reasons() {
         let reasons = [

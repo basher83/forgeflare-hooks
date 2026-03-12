@@ -2318,6 +2318,133 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn parallel_path_guard_blocked_skips_post_hooks() {
+        // hooks.md R7: "PostToolUse fires only for tools that were dispatched,
+        // not for blocked tools." This verifies that guard-hook blocked tools
+        // (as opposed to null-input blocked) also skip PostToolUse via blocked_flags.
+        let dir = tempfile::tempdir().unwrap();
+        let hook_script = dir.path().join("block_bash.sh");
+        std::fs::write(
+            &hook_script,
+            "#!/bin/bash\necho '{\"action\":\"block\",\"reason\":\"policy\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let config_path = dir.path().join("hooks.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[hooks]]\nevent = \"PreToolUse\"\nphase = \"guard\"\ncommand = \"{}\"\nmatch_tool = \"Bash\"\n",
+                hook_script.display()
+            ),
+        )
+        .unwrap();
+        let hooks = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
+
+        let tool_uses: Vec<(String, String, serde_json::Value)> = vec![
+            // Tool 0: Read (no guard match) → Allow → dispatched
+            (
+                "tu_0".to_string(),
+                "Read".to_string(),
+                serde_json::json!({"file_path": "/dev/null"}),
+            ),
+            // Tool 1: Bash (guard blocks it) → Blocked
+            (
+                "tu_1".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo hello"}),
+            ),
+        ];
+        let batch_size = tool_uses.len();
+        let mut slots: Vec<Option<ContentBlock>> = vec![None; batch_size];
+        let mut blocked_flags: Vec<bool> = vec![false; batch_size];
+        let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
+        let mut consecutive_block_count = 0usize;
+        let mut total_block_count = 0usize;
+
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            match run_pre_dispatch(
+                &hooks,
+                id,
+                name,
+                input,
+                0,
+                &mut consecutive_block_count,
+                &mut total_block_count,
+            )
+            .await
+            {
+                PreDispatchResult::Allow => {
+                    let id = id.clone();
+                    let name = name.clone();
+                    let input = input.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        dispatch_to_tool_result(id, name, input)
+                    });
+                    spawn_futures.push((i, handle));
+                }
+                PreDispatchResult::Blocked(cb) => {
+                    slots[i] = Some(cb);
+                    blocked_flags[i] = true;
+                }
+                PreDispatchResult::ThresholdTripped => break,
+            }
+        }
+
+        join_spawned_futures(spawn_futures, &mut slots, &tool_uses).await;
+
+        // Verify: Read tool dispatched normally
+        assert!(!blocked_flags[0], "Read should not be blocked");
+        assert!(slots[0].is_some(), "Read slot should have result");
+
+        // Verify: Bash blocked by guard hook
+        assert!(blocked_flags[1], "Bash should be blocked by guard hook");
+        if let Some(ContentBlock::ToolResult {
+            content, is_error, ..
+        }) = &slots[1]
+        {
+            assert!(
+                content.contains("policy"),
+                "blocked reason should contain guard hook reason"
+            );
+            assert_eq!(*is_error, Some(true));
+        } else {
+            panic!("expected ToolResult for guard-blocked slot");
+        }
+
+        // Verify: post-dispatch skips the guard-blocked tool
+        let mut post_dispatch_count = 0;
+        for (i, (_, name, input)) in tool_uses.iter().enumerate() {
+            if blocked_flags[i] {
+                continue;
+            }
+            if let Some(ContentBlock::ToolResult {
+                ref content,
+                is_error,
+                ..
+            }) = slots[i]
+            {
+                let is_err = is_error.unwrap_or(false);
+                let _ = run_post_dispatch(&hooks, name, input, content, is_err, 0, false).await;
+                post_dispatch_count += 1;
+            }
+        }
+        assert_eq!(
+            post_dispatch_count, 1,
+            "post-dispatch should only fire for the non-blocked Read tool"
+        );
+
+        // Block counters: guard hook block increments both consecutive and total
+        assert_eq!(consecutive_block_count, 1);
+        assert_eq!(total_block_count, 1);
+    }
+
     #[test]
     fn threshold_takes_precedence_over_signal_break() {
         // hooks.md R6: "Block threshold takes unconditional precedence over

@@ -938,6 +938,22 @@ mod tests {
         assert_eq!(result, vec!["**/*.rs", "**/*.toml", "**/*.md"]);
     }
 
+    #[test]
+    fn glob_brace_expansion_invalid_pattern_fails_entirely() {
+        // glob-shell-injection R5: if brace expansion produces an invalid pattern,
+        // the entire operation must fail — no partial results returned.
+        // `[` is an invalid glob pattern (unclosed character class).
+        let result = dispatch_tool("Glob", &json!({"pattern": "*.{rs,[}"}), &mut |_| {});
+        assert!(
+            result.is_err(),
+            "brace expansion producing invalid pattern should fail entirely"
+        );
+        assert!(
+            result.unwrap_err().contains("Invalid glob pattern"),
+            "error should mention invalid glob pattern"
+        );
+    }
+
     // --- ToolEffect classification tests ---
 
     #[test]

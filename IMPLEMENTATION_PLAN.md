@@ -1,6 +1,6 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 4/4 fixed. 168 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 8/8 fixed. 172 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
@@ -9,6 +9,8 @@ Updated 2026-03-12: Full spec-vs-implementation audit across all 16 specs. Three
 Updated 2026-03-12: Second audit pass found two test coverage gaps in parallel dispatch path. Both fixed in v0.0.19: (1) null-input tool_use in parallel path — test verifies error ToolResult produced and post-hooks skipped via blocked_flags; (2) mid-batch threshold trip — test verifies already-spawned futures joined, threshold_tripped set, and empty result returned.
 
 Updated 2026-03-12: Third audit pass (v0.0.21). Four issues found and fixed: (1) Cargo.toml version was `0.1.0` while git tags were `v0.0.x` — session transcripts via `env!("CARGO_PKG_VERSION")` were lying. Fixed to `0.0.21`. (2) Missing test for Stop hook returning unrecognized action value (hooks.md R3). Added `stop_unrecognized_action_does_not_panic`. (3) Missing test for `threshold_tripped` precedence over `signal_break` (hooks.md R6). Added `threshold_takes_precedence_over_signal_break`. (4) glob-shell-injection.md R2 incorrectly stated glob crate returns "filesystem order (platform-dependent)" — corrected to "alphabetical order" per implementation notes.
+
+Updated 2026-03-12: Fourth audit pass (v0.0.22). Full spec-vs-implementation test coverage audit. Four new tests added: (1) SSE error with absent `error.type` field defaults to transient (api-retry R1). (2) Brace expansion producing invalid pattern fails the entire glob operation (glob-shell-injection R5). (3) Convergence write failure returns Err without panic (hooks R8, unix-only). (4) Guard-hook blocked tools skip PostToolUse via blocked_flags (hooks R7).
 
 ## Spec Audit Results (2026-03-12)
 

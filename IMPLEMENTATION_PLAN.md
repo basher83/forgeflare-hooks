@@ -1,10 +1,10 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fix: 1/1 fixed. 163 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. 164 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
-Updated 2026-03-12: Full spec-vs-implementation audit across all 16 specs. One gap found and fixed: release workflow missing `--latest` flag on `gh release create` (spec R4). All other specs fully implemented. Tagged v0.0.16.
+Updated 2026-03-12: Full spec-vs-implementation audit across all 16 specs. Three gaps found and fixed: (1) release workflow missing `--latest` flag (spec R4, v0.0.16); (2) actions/checkout SHA mismatch between ci.yml and release.yml (spec R6, v0.0.16); (3) unknown SSE error types classified as permanent instead of transient (api-retry spec R1, v0.0.17).
 
 ## Spec Audit Results (2026-03-12)
 
@@ -13,7 +13,7 @@ Full line-by-line audit of all specs against implementation. Results:
 - `coding-agent.md` — Fully implemented. Two intentional deviations documented below.
 - `tool-name-compliance.md` — No gaps.
 - `api-endpoint.md` — No gaps. Three-tier URL precedence, conditional API key, trailing slash strip.
-- `api-retry.md` — No gaps. Exponential backoff, Retry-After cap, error classification.
+- `api-retry.md` — One gap fixed: unknown SSE error types defaulted to permanent (`StreamParse`) instead of transient (`StreamTransient`). Now only `invalid_request_error` is permanent; all others trigger retry (v0.0.17).
 - `session-capture.md` — No gaps. JSONL transcripts, usage parsing, session identity.
 - `token-aware-trim.md` — No gaps. 120K threshold gating, byte-based fallback.
 - `maxtoken-continuation.md` — No gaps. 3-attempt cap, classify_max_tokens enum.
@@ -24,7 +24,7 @@ Full line-by-line audit of all specs against implementation. Results:
 - `prompt-caching.md` — No gaps. System prompt + last tool cache_control.
 - `project-instructions-loading.md` — No gaps. CLAUDE.md/AGENTS.md with priority, size limit, permission checks.
 - `run-turn-refactor.md` — No gaps. Extracted helpers, both bug fixes, under 350 lines.
-- `release-workflow.md` — One gap fixed: `--latest` flag added to `gh release create` (v0.0.16).
+- `release-workflow.md` — Two gaps fixed: `--latest` flag added to `gh release create` (v0.0.16); `actions/checkout` SHA aligned with ci.yml (v0.0.16).
 
 ## Intentional Spec Deviations (by design, not bugs)
 

@@ -1,0 +1,113 @@
+<task-notification>
+<task-id>a0210d32c81f65605</task-id>
+<tool-use-id>toolu_012W76XuB7r6YXqJXFA3AprU</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/8aac52da-2edf-4887-bae8-ee91f66f8d8c/tasks/a0210d32c81f65605.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit release workflow spec" completed</summary>
+<result>I have everything I need. Here is a thorough requirement-by-requirement analysis.
+
+---
+
+## Verification Report: `release-workflow.md` vs `.github/workflows/release.yml`
+
+### R1. Trigger
+
+**Status: Implemented correctly.**
+
+The workflow triggers on `push: tags: "v*"`. There is no `workflow_dispatch` trigger, matching the spec's explicit exclusion of manual dispatch.
+
+---
+
+### R2. Build Matrix
+
+**Status: Implemented correctly.**
+
+Both targets are present — `aarch64-apple-darwin` on `macos-latest` and `x86_64-unknown-linux-gnu` on `ubuntu-latest`. Each leg runs `cargo test` before `cargo build --release`.
+
+---
+
+### R3. Artifact Packaging
+
+**Status: Implemented correctly.**
+
+The tarball is named `forgeflare-${TAG}-${{ matrix.target }}.tar.gz`, contains only the `forgeflare` binary from `target/release`, and uses `tar -czf` (gzip). This matches all three sub-requirements.
+
+---
+
+### R4. GitHub Release
+
+**Status: Two gaps found.**
+
+The release step uses `gh release create "${TAG}" --title "${TAG}" --generate-notes` and attaches both tarballs. Title and auto-generated notes are correct.
+
+Gap 1 — `--latest` flag is absent. The `gh release create` command does not include `--latest`. By default GitHub marks the release as latest only if it is the most recent by version sort, but the spec explicitly requires "Mark as latest release." Omitting `--latest` means this is implicitly dependent on GitHub's ordering logic rather than being explicitly enforced. It should be `gh release create "${TAG}" --latest ...`.
+
+Gap 2 — Tarball naming uses `${GITHUB_REF_NAME}` which is set by GitHub for the tag ref, so functionally correct, but worth noting it relies on the environment variable rather than a more explicit extraction. This is not a spec deviation.
+
+---
+
+### R5. CI Gate
+
+**Status: Not implemented as specified.**
+
+This is the most significant gap. The spec states:
+
+> "Release job depends on existing CI jobs (lint, audit, test, build) passing"
+> "The release workflow either triggers CI as a prerequisite or the release workflow file includes the CI validation steps inline per matrix leg"
+
+What was implemented: the `build` job in `release.yml` runs `cargo fmt --check`, `cargo clippy`, `cargo audit`, and `cargo test` inline on each matrix leg before building. So validation does happen.
+
+However, the spec's primary intent (confirmed by the architecture diagram showing a separate "CI gate" box that "must pass" before the build matrix runs) was to use `ci.yml`'s jobs as a prerequisite. The `ci.yml` file has `workflow_call:` as a trigger, which means it was designed to be called from other workflows. The `release.yml` never calls or depends on `ci.yml` at all.
+
+The practical consequence: CI runs independently from the release workflow. A tag push triggers both `ci.yml` and `release.yml` simultaneously and independently. The release build does not wait for the separate CI workflow to pass — it re-runs equivalent steps inline. If CI fails on the tag push, the release workflow may still succeed and publish artifacts.
+
+The spec's architecture diagram shows `CI gate → build matrix → release`, a sequential dependency. The implementation runs them in parallel with no cross-workflow dependency.
+
+This is a structural deviation. The `workflow_call` support in `ci.yml` exists precisely to enable the intended pattern:
+
+```yaml
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: [ci]
+    ...
+```
+
+That wiring is absent from `release.yml`.
+
+---
+
+### R6. Consistency with Existing CI
+
+**Status: Mostly implemented, one deviation.**
+
+`jdx/mise-action` and `Swatinem/rust-cache` are both used with pinned SHAs. Permissions are correctly scoped: `contents: read` on build jobs, `contents: write` on the release job.
+
+Deviation — the pinned SHAs for shared actions differ between `ci.yml` and `release.yml`:
+
+- `actions/checkout`: `ci.yml` uses `de0fac2e4500dabe0009e67214ff5f5447ce83dd` (tagged as v6 in comments), `release.yml` uses `34e114876b0b11c390a56381ad16ebd13914f8d5` (tagged as v4.3.1). These are different commits pointing to different versions of the same action.
+- `jdx/mise-action` and `Swatinem/rust-cache` SHAs match between the two files.
+
+The spec says "Pin all action SHAs (same convention as `ci.yml`)." Using different SHA pins for `actions/checkout` violates this consistency requirement.
+
+---
+
+### R7. Cross-Compilation
+
+**Status: Implemented correctly.**
+
+Both targets use native runners. No cross-compilation toolchain, no `cross` crate, no `cargo-zigbuild`.
+
+---
+
+## Summary of Gaps
+
+1. **R4 — Missing `--latest` flag** on `gh release create`. The release may not be explicitly marked as latest.
+
+2. **R5 — CI gate not wired.** The `release.yml` does not call or depend on `ci.yml` via `workflow_call`. CI and the release workflow run in parallel on tag push. The `ci.yml` file exposes `workflow_call` for exactly this purpose but is never invoked. The inline validation steps in each build leg are not a substitute for the gated dependency the spec describes.
+
+3. **R6 — `actions/checkout` SHA mismatch** between `ci.yml` (`de0fac2e`, labeled v6) and `release.yml` (`34e114876`, labeled v4.3.1). The spec requires consistent SHA pinning following `ci.yml`'s convention.</result>
+<usage><total_tokens>42706</total_tokens><tool_uses>4</tool_uses><duration_ms>41840</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/8aac52da-2edf-4887-bae8-ee91f66f8d8c/tasks/a0210d32c81f65605.output

@@ -1,0 +1,37 @@
+<task-notification>
+<task-id>af3997c38269a05d8</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/eeeed8f3-a8d1-4311-9281-97af3bad182b/tasks/af3997c38269a05d8.output</output-file>
+<status>completed</status>
+<summary>Agent "Check supervisor.sh untracked file" completed</summary>
+<result>Now I have everything I need to give a complete picture.
+
+**What supervisor.sh does**
+
+`supervisor.sh` is a watchdog script for `loop.sh`, the agentic Claude Code iteration loop used in this project's "Ralph Wiggum" autonomous build system. It is not part of the Rust application being built — it is developer tooling for running and babysitting that application's development loop.
+
+Its responsibilities:
+
+1. Preflight checks — verifies `cmux` (a terminal multiplexer control CLI) is available and responding, and that `loop.sh` exists.
+
+2. Pane creation — uses `cmux new-split` to open a right-side split pane and launches `loop.sh` (with any forwarded arguments) inside it.
+
+3. Screen polling — every 15 seconds, it captures the last 200 lines of that pane via `cmux read-screen`, hashes the output, and reacts based on what it sees:
+
+   - Clean exit patterns ("Reached max iterations", "Task complete") — sets status to `converged` and exits cleanly.
+   - Shell prompt visible (loop process exited on its own) — triggers a restart unless exit was clean.
+   - Fatal error patterns (context length, JSON parse errors, ENOENT, connection refused, etc.) — triggers a restart.
+   - Inactivity (hash unchanged for 40 consecutive polls = 10 minutes) — marks state as `hung` and restarts.
+
+4. Restart management — up to 5 restarts via `cmux send-key ctrl+c` followed by re-issuing the loop command. After the limit, it gives up with state `failed`.
+
+5. Status reporting — updates a `cmux` status bar with state labels and colors, tracks iteration progress via `cmux set-progress`, and prints a final summary table on exit.
+
+**Should it be committed or gitignored?**
+
+`loop.sh` is already committed and tracked in the repo — it is the primary autonomous-loop driver. `supervisor.sh` is a direct companion to `loop.sh` and is operationally equivalent in character: developer tooling, checked-in alongside the project, used to run the build loop reliably. There is no `.gitignore` entry for it, and there is no indication it contains environment-specific secrets or machine-specific paths. It is generic shell using only `cmux` commands and relative paths.
+
+The recommendation is to commit it. It serves the same role as `loop.sh` (which is already committed), it is not generated or ephemeral, and any developer running the Ralph loop on a `cmux`-equipped machine would want it. If the project ever decides operator tooling should be separated from the source repo, both `loop.sh` and `supervisor.sh` would move together — but that is not the current pattern here.</result>
+<usage><total_tokens>47575</total_tokens><tool_uses>5</tool_uses><duration_ms>41190</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/eeeed8f3-a8d1-4311-9281-97af3bad182b/tasks/af3997c38269a05d8.output

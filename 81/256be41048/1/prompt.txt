@@ -1,0 +1,29 @@
+/git-status
+
+---
+
+forge-doctrine/ is not part of this repo. thats at the dir above this
+
+---
+
+orrrrr we properly fix it so this repo isn't trying to track it
+
+---
+
+why gitignore? it' shouldn't be in this repo at all
+
+---
+
+ohhhhh okokok I see now. the entire repo got pulled in here and committed. wtf!
+
+---
+
+ok but first lets make sure we don't nuke shit i need. compare ~/3I/forge/forge-doctrine to ~/3I/forge/forgeflare-hooks/forge-doctrine. ~/3I/forge/forge-doctrine is where everything should be
+
+---
+
+yes, need all three in ~/3I/forge/forge-doctrine, then nuke the nested one
+
+---
+
+lets do it

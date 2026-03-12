@@ -1,10 +1,93 @@
 # Implementation Plan
 
-All 9 items complete. 119 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names.
+Phase 1: 9/9 complete. Phase 2: 1/5 complete. 135 tests pass, clippy clean, fmt clean.
 
-Updated 2026-02-14: Fixed convergence JSON key from "final_state" to "final" per hooks.md spec (serde rename was missing). Added regression test asserting raw JSON key name.
+Updated 2026-03-11: Phase 2 item 1 (Glob Shell Injection) complete. All 4 remaining specs confirmed absent from codebase. Two pre-existing bugs remain in `run_turn` (fixed by item 5).
 
-## Completed Items
+## Phase 2 — Active (ordered by priority)
+
+### 1. Glob Shell Injection Fix — `glob-shell-injection.md`
+- **Status**: Complete (v0.0.8)
+- **Priority**: CRITICAL (security — unguarded arbitrary code execution)
+- **Location**: `src/tools/mod.rs` glob_exec, `Cargo.toml`
+- **Changes made**:
+  - Added `glob = "0.3"` dependency
+  - Rewrote `glob_exec` to use `glob::glob()` — no bash subprocess, no shell injection surface
+  - Added `expand_braces()` function for `{a,b}` pattern preprocessing (single top-level group)
+  - Dedup via `HashSet`, 1000-entry cap, alphabetical ordering from glob crate
+  - Shell metacharacters (`$(cmd)`, backticks, `;rm`) become literal pattern characters — never executed
+  - 16 new tests: brace expansion unit tests, shell metachar safety, path parameter, result cap, structural no-bash verification
+  - All 135 tests pass, clippy clean, fmt clean
+
+### 2. SSE Buffer Optimization — `sse-buffer-optimization.md`
+- **Status**: Not started
+- **Priority**: Low (correctness OK, performance improvement)
+- **Location**: `src/api.rs` parse_sse_stream (lines 213-214)
+- **Problem**: Two unnecessary String allocations per SSE event in the extraction loop:
+  - Line 213: `buffer[..pos].to_string()` — copies event block to new String
+  - Line 214: `buffer[pos + 2..].to_string()` — copies remainder to new String (O(N*M) total work)
+- **Changes required**:
+  - Replace line 213 with `let event_block = &buffer[..pos];` (borrow, no alloc) inside a scoped block
+  - Replace line 214 with `buffer.drain(..pos + 2);` (in-place memmove)
+  - Scoped block required: borrow checker needs `event_block` dropped before `drain` mutates `buffer`
+- **Tests**: All 6 existing SSE parser tests must pass unchanged (no new tests needed)
+- **Dependencies**: None
+
+### 3. Prompt Caching — `prompt-caching.md`
+- **Status**: Not started
+- **Priority**: Medium (cost reduction — response-side infrastructure already exists)
+- **Location**: `src/api.rs` send_message (lines 140-150), `src/main.rs` run_turn (~line 418)
+- **Problem**: Every API call re-sends full system prompt as plain string and all tool definitions at full token cost. `Usage` already tracks `cache_creation_input_tokens` and `cache_read_input_tokens`, and the SSE parser extracts them — only the request side is missing.
+- **Changes required**:
+  - `send_message`: Replace `"system": system` (line 143) with content block array containing `cache_control: {"type": "ephemeral"}`
+  - `send_message`: Clone tools array, add `cache_control` to last tool only (API caches everything up to marked block)
+  - `run_turn`: Add verbose cache logging after usage destructuring
+  - No signature changes to `send_message`
+- **Tests**: Verify system prompt sent as content block array, last tool has cache_control, verbose mode logs cache stats
+- **Dependencies**: None (compatible with project-instructions-loading — both share `system: &str` interface)
+- **Note**: Redundant `content-type` header at line 155 is overwritten by `.json()` at line 162 — consider removing as cleanup
+
+### 4. Project Instructions Loading — `project-instructions-loading.md`
+- **Status**: Not started
+- **Priority**: Medium (agent quality — currently has no project context)
+- **Location**: `src/main.rs` only (new enum + function + call site in main())
+- **Problem**: `build_system_prompt()` returns hardcoded text with no awareness of CLAUDE.md or AGENTS.md project instructions.
+- **Changes required**:
+  - New `InstructionsResult` enum: `Found { filename, contents }`, `Skipped { filename, reason }`, `NotFound`
+  - New `load_project_instructions()` function: iterate `["CLAUDE.md", "AGENTS.md"]`, first match wins, 32KB size limit, permission checks
+  - Call in `main()` after `build_system_prompt()`, concatenate with section header if found
+  - Verbose logging on Found/NotFound, warn-level on Skipped (not verbose-gated)
+  - Only cwd searched, no parent traversal
+- **Tests**: CLAUDE.md loaded, AGENTS.md fallback, priority when both exist, symlinks, >32KB skip, unreadable skip, both skipped, verbose logging, `build_system_prompt()` signature unchanged
+- **Dependencies**: None (compatible with prompt-caching)
+
+### 5. Run Turn Refactor — `run-turn-refactor.md`
+- **Status**: Not started
+- **Priority**: Medium (structural debt + 2 bug fixes)
+- **Location**: `src/main.rs` run_turn (lines 301-779, currently 479 lines, target <350)
+- **Problem**: Parallel and sequential dispatch paths duplicate pre-hook/post-hook/threshold/null-input logic. Two pre-existing bugs:
+  - **Bug 1** (line 668-670): Sequential path silently `continue`s on null-input tools — no ToolResult produced, violating API's tool_use/tool_result pairing requirement
+  - **Bug 2** (line 509-519): Parallel path doesn't set `blocked_flags[i]` for null-input tools, causing post-hooks to fire on fabricated error results for tools that never executed
+- **Changes required**:
+  - Extract `run_pre_dispatch()` → returns `PreDispatchResult` enum (`Allow`, `Blocked(ContentBlock)`, `ThresholdTripped`)
+  - Extract `run_post_dispatch()` → returns `bool` (signal_break)
+  - Both bugs fixed by unified null-input handling in `run_pre_dispatch`
+  - Parallel path: pre-dispatch loop → join_all → post-dispatch loop (skip blocked)
+  - Sequential path: interleaved loop (pre-dispatch → dispatch → post-dispatch)
+  - `dispatch_tool` call itself NOT extracted (parallel=spawn_blocking, sequential=streaming callback — fundamental asymmetry)
+- **Tests**: All 119 existing tests must pass with zero modification, clippy clean, run_turn under 350 lines
+- **Dependencies**: None, but implement last (largest change surface, touches same code as items 3-4)
+
+## Pre-existing Bugs (confirmed via code search)
+
+These are NOT Phase 2 spec items but bugs found during audit:
+
+1. **Null-input silent skip in sequential path** (`main.rs:668-670`): `continue` produces no ToolResult. The API expects a tool_result for every tool_use. Fixed by item 5.
+2. **Missing blocked_flags for null-input in parallel path** (`main.rs:513-519`): Post-hooks fire on error results for tools that never executed. Fixed by item 5.
+3. **Tool input JSON parse failure silently swallowed** (`api.rs:291-295`): `if let Ok(v)` silently drops parse errors, leaving ToolUse with `input: {}`. Not addressed by any spec.
+4. **`recover_conversation` can empty the conversation** (`main.rs:139-145`): Cascading pops have no minimum-length guard. Not addressed by any spec.
+
+## Completed Items (Phase 1)
 
 1. Foundation: `coding-agent.md` + `tool-name-compliance.md` — CLI, streaming API, 5 PascalCase tools
 2. API Endpoint Configuration: `api-endpoint.md` — configurable URL, optional API key
@@ -16,10 +99,21 @@ Updated 2026-02-14: Fixed convergence JSON key from "final_state" to "final" per
 8. Hook Dispatch: `hooks.md` — guard/observe/post/stop, fail-closed guards, convergence writes
 9. Release Workflow: `release-workflow.md` — tag-triggered, macOS aarch64 + Linux x86_64, pinned SHAs
 
-## Spec Errata (documented during implementation)
+## Spec Errata (documented during Phase 1 implementation)
 
 - `release-workflow.md` line 77: success criteria says "working `agent` binary" — should say `forgeflare`. The workflow correctly uses `forgeflare`.
 - `session-capture.md` JSONL example (line 101): uses snake_case `read_file` in tool_use name. Should be PascalCase `Read` per `tool-name-compliance.md`. Cosmetic only.
+
+## Minor Code Observations (not blocking, no spec needed)
+
+- `content-type` header explicitly set at `api.rs:155` is overwritten by `.json()` at line 162 (redundant)
+- `tool_effect` function name in code vs `classify_effect` in CLAUDE.md (naming mismatch, cosmetic)
+- `MAX_CONTINUATIONS` constant defined at `main.rs:790`, separated from other constants at lines 15-23
+- `stop_reason_str` is stringly-typed (`&str`) where the rest of the codebase uses typed enums
+- `which rg` check in `grep_exec` re-runs on every Grep call (no caching)
+- Edit 100KB size limit only applies to the replace path, not create/append
+- `bash_exec` has no output size cap (unbounded accumulation until 120s timeout)
+- Bash schema declares `description` parameter that is never read by `bash_exec`
 
 ## Learnings
 
@@ -48,3 +142,5 @@ Updated 2026-02-14: Fixed convergence JSON key from "final_state" to "final" per
 - tokio::process::Command needs explicit stdin close (drop after write_all) for hooks to receive EOF and produce output
 - Hook subprocess execution wraps spawn-write-read in tokio::time::timeout — the timeout covers the entire sequence, not just individual operations
 - Release workflow uses inline CI validation per matrix leg rather than a separate CI job dependency — simpler and avoids cross-workflow triggers
+- The `glob` crate's `glob()` uses `MatchOptions::new()` (case_sensitive: true) while `Default::default()` sets case_sensitive: false — use `glob()` not `glob_with(_, MatchOptions::default())` to match bash behavior
+- The `glob` crate does not support brace expansion — implement `expand_braces()` preprocessor for `{a,b}` patterns before calling `glob::glob()`

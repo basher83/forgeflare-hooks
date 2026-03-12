@@ -1,0 +1,274 @@
+<task-notification>
+<task-id>af1efe7fc8c1f0323</task-id>
+<tool-use-id>toolu_01WmaKhJuTAzWFWnWWMRXhsL</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/eeeed8f3-a8d1-4311-9281-97af3bad182b/tasks/af1efe7fc8c1f0323.output</output-file>
+<status>completed</status>
+<summary>Agent "Read all spec files" completed</summary>
+<result>Here is a comprehensive summary of each spec, organized by theme.
+
+---
+
+## What the Application Is
+
+Forgeflare is a single-binary Rust coding agent that runs a REPL loop: it takes user input, calls the Anthropic Claude API via streaming SSE, dispatches tool calls, and repeats. It is designed specifically to run as an autonomous "Ralph loop" agent — a non-interactive coding assistant that iterates on a codebase until convergence. It targets the Anthropic OAuth proxy on a Tailscale tailnet by default, so no API key is needed in the normal case.
+
+The five tools are `Read`, `Glob`, `Bash`, `Edit`, and `Grep` (PascalCase for OAuth proxy compatibility).
+
+---
+
+## Spec Summaries
+
+### coding-agent.md (Complete)
+
+The foundation spec. Defines the single-binary architecture: `src/main.rs` (CLI loop), `src/api.rs` (reqwest + SSE client), `src/tools/mod.rs` (5 tools via `tools!` macro). Key design decisions: streaming from day 1 (no batch mode), a `tools!` macro generates schemas while dispatch is hand-written, a 50-iteration tool loop ceiling, 720KB context budget with trim at exchange boundaries, a bash deny-list for destructive commands, and `NO_COLOR` support. The target is under 950 production lines.
+
+Potentially incomplete: The spec says "no automatic retry; failures return to user" — explicitly superseded by api-retry.md. The "subagent awareness" feature is deferred with only a `StopReason` enum stub remaining.
+
+---
+
+### tool-name-compliance.md (Complete)
+
+Renames the five tools from snake_case (`read_file`, `list_files`, `bash`, `edit_file`, `code_search`) to PascalCase (`Read`, `Glob`, `Bash`, `Edit`, `Grep`) throughout the `tools!` macro, `dispatch_tool()` match arms, `build_system_prompt()`, tests, and `AGENTS.md`. The motivation is that Anthropic's OAuth proxy validates tool names against Claude Code's known tool set — lowercase names return 400 errors. Internal function names (`bash_exec`, etc.) are unchanged.
+
+---
+
+### api-endpoint.md (Complete)
+
+Makes the API endpoint configurable with the tailnet OAuth proxy (`https://anthropic-oauth-proxy.tailfb3ea.ts.net`) as the default. Adds `--api-url` CLI arg (also reads `ANTHROPIC_API_URL` env var). `ANTHROPIC_API_KEY` becomes optional — when absent, no auth header is sent and the proxy injects its own Bearer token. `AnthropicClient` gains `api_url: String` and `api_key: Option<String>`. The `MissingApiKey` error variant is removed.
+
+---
+
+### api-retry.md (Complete)
+
+Adds retry logic for transient API failures (429, 503, 529, network timeouts, SSE overload events). Classifies errors: `HttpError` (retry on 5xx and 429), `StreamTransient` (always retry), `StreamParse` (never retry), `Api(reqwest::Error)` (retry on timeout/connect errors), `Json` (never retry). Up to 4 retries with exponential backoff (2s, 4s, 8s, 16s). If `Retry-After` header is present, its value is used instead (capped at 60s). Retry logic lives in `main.rs` wrapping the `send_message()` call, not inside the SSE parser. Explicitly supersedes coding-agent.md's "no automatic retry" rule for autonomous operation.
+
+---
+
+### session-capture.md (Complete)
+
+Persists conversation transcripts to `.entire/metadata/{session-id}/full.jsonl` in Entire.io-compatible JSONL format. Each line is a conversation turn with: `sessionId`, `uuid`, `parentUuid`, `timestamp`, `cwd`, `version`, and the message content. Token usage (input, output, cache creation, cache read) from API `message_start`/`message_delta` events is attached to assistant turns. Also writes `prompt.txt` (first user input) and `context.md` (session metadata + key actions list). Writes are append-only and incremental — survives mid-session crashes. Requires adding `uuid` and `chrono` crate dependencies.
+
+---
+
+### maxtoken-continuation.md (Complete)
+
+When the API returns `stop_reason: max_tokens` and the truncation happened in a text block (no valid tool_use blocks pending), the agent injects a "Continue from where you left off." user message and loops back to the API instead of breaking. Capped at 3 continuations per inner loop session via `continuation_count`. If max_tokens fires with valid tool_use blocks, those are dispatched normally. If the post-filter response is empty, breaks immediately. Introduces a canonical control flow restructure replacing the `if stop_reason != ToolUse { break }` block.
+
+---
+
+### token-aware-trim.md (Complete)
+
+Uses the actual `input_tokens` count from API responses to gate whether `trim_conversation()` runs. After the first API call, if `last_input_tokens < 120,000` (60% of Claude's 200K context window), the expensive byte-based trim is skipped entirely. The 60% threshold leaves 80K tokens of headroom for tool results added between API calls. The byte-based trim (`trim_conversation()` itself) is unchanged and still runs as a safety net when tokens exceed the threshold or on the first call (no token data yet).
+
+---
+
+### tool-parallelism.md (Complete)
+
+Classifies tools by side effects: `Read`, `Glob`, `Grep` are `Pure`; `Bash`, `Edit` are `Mutating`. If an entire tool batch is pure, tools are dispatched concurrently via `tokio::task::spawn_blocking` + `futures_util::future::join_all`. If any tool is mutating, the entire batch runs sequentially (existing behavior). Results are collected in original order. The streaming callback for Bash stays in the sequential path; the parallel path uses a no-op callback. A `ToolEffect` enum and `tool_effect()` function are exposed from `tools/mod.rs`.
+
+---
+
+### hooks.md (Complete)
+
+The most complex spec. Implements a shell-based hook system loaded from `.forgeflare/hooks.toml`. Three hook events:
+
+- `PreToolUse`: guard phase (fail-closed, can block) then observe phase (fail-open, always runs). Returns `Allow` or `Block`.
+- `PostToolUse`: observes tool results, can return a `Signal` that sets a `signal_break` flag, causing the inner loop to break after the current batch (with conversation in valid state, no `recover_conversation()` needed).
+- `Stop`: fires on any exit reason (end_turn, iteration_limit, api_error, continuation_cap, block_limit_consecutive, block_limit_total, convergence_signal).
+
+Hooks are executables communicating via JSON stdin/stdout. Stderr is forwarded. Convergence state is written to `.forgeflare/convergence.json` via atomic temp-file rename. Two block counters: `consecutive_block_count` (threshold 3, resets on allow) and `total_block_count` (threshold 10, never resets within inner loop). When a threshold trips, `conversation.pop()` is used directly (not `recover_conversation()`, because the conversation state at that point is `[..., Assistant(tool_use)]` with no trailing User message).
+
+A `HookRunner` struct in `src/hooks.rs` implements all hook logic. `dispatch_tool` signature is unchanged.
+
+---
+
+### release-workflow.md (Complete)
+
+Defines `.github/workflows/release.yml`. Triggers on version tags (`v*`). Build matrix: `aarch64-apple-darwin` on `macos-latest` and `x86_64-unknown-linux-gnu` on `ubuntu-latest` — both native builds, no cross-compilation. Each leg runs tests before packaging. Output: `forgeflare-{tag}-{target}.tar.gz` tarballs. Release is created only after CI (lint, audit, test) passes. Auto-generated release notes via `gh release create --generate-notes`. Action SHAs pinned, least-privilege permissions.
+
+---
+
+### glob-shell-injection.md (Active — not yet implemented)
+
+Security fix. `glob_exec` currently interpolates user-supplied patterns directly into `bash -c "..."`, creating a shell injection vector. Since `Glob` is classified `ToolEffect::Pure`, guard hooks skip it entirely, making it an unguarded arbitrary code execution path. The fix replaces the shell-out with the `glob` Rust crate (`glob = "0.3"`). Adds brace expansion pre-processing to support patterns like `**/*.{rs,toml}` (which the glob crate does not natively handle). Only a single top-level brace group is supported. The 1000-entry result cap is preserved.
+
+---
+
+### sse-buffer-optimization.md (Active — not yet implemented)
+
+Micro-optimization to the SSE parser. Currently, extracting each SSE event from the accumulation buffer does two allocations: `buffer[..pos].to_string()` (the event block) and `buffer[pos + 2..].to_string()` (the remainder). The fix replaces these with a `&buffer[..pos]` slice reference (no alloc) and `buffer.drain(..pos + 2)` in-place removal. A scoped borrow block is required to satisfy the borrow checker. The parser's behavior is identical; it just eliminates O(N) gratuitous copies across a streaming response.
+
+---
+
+### prompt-caching.md (Active — not yet implemented)
+
+Adds `cache_control: {"type": "ephemeral"}` to the system prompt and the last tool definition in every API request. The system prompt changes from a plain string field to an array of content blocks. The `Usage` struct and SSE parser already track cache tokens (`cache_creation_input_tokens`, `cache_read_input_tokens`) — this only changes the request side. In verbose mode, logs cache hit statistics per API call. Cache creation costs 25% more on the first call; subsequent reads cost 10% of normal input tokens. Break-even is at 2 API calls; Ralph loops make 10–50 calls per iteration.
+
+---
+
+### project-instructions-loading.md (Active — not yet implemented)
+
+At startup, after building the base system prompt, the agent tries to load `CLAUDE.md` then `AGENTS.md` from cwd. First file found wins (they're often symlinked). Files over 32KB are skipped with a warning; unreadable files fall through to the next candidate. Loaded contents are appended to the system prompt under a `## Project Instructions (from {filename})` section header. A private `load_project_instructions()` function returns an `InstructionsResult` enum (`Found`, `Skipped`, `NotFound`); all logging is done by the caller. No changes to `build_system_prompt()` or `send_message()` signatures.
+
+---
+
+### run-turn-refactor.md (Active — not yet implemented)
+
+Extracts duplicated pre/post dispatch protocol logic out of `run_turn`, which is currently ~480 lines with 8 parameters. The parallel and sequential dispatch paths share: null-input guard, pre-hook invocation, block counting, threshold checking, result logging, and post-hook invocation. The fix extracts two async functions: `run_pre_dispatch()` (returns `PreDispatchResult: Allow | Blocked(ContentBlock) | ThresholdTripped`) and `run_post_dispatch()` (returns `bool` signal_break). The actual dispatch (spawn_blocking/join_all vs sequential with streaming callback) is intentionally NOT extracted. Target: `run_turn` under 350 lines. Also fixes two pre-existing bugs: (1) null-input tools in the sequential path previously silently skipped instead of producing an error ToolResult, and (2) null-input tools in the parallel path did not set `blocked_flags`, causing post-hooks to fire on fabricated error results.
+
+---
+
+### README.md (specs index)
+
+The index. Tracks status (Active vs Complete) for all 15 specs plus their primary code locations. Defines the two implementation phases: Phase 1 (10 items, all complete), Phase 2 (5 items, all Active — the current work queue, ordered by priority).
+
+---
+
+## Summary of Remaining Work
+
+The five Active specs are the current work queue, in the order the README prescribes:
+
+1. `glob-shell-injection.md` — security fix, only touches `src/tools/mod.rs`
+2. `sse-buffer-optimization.md` — trivial performance fix, only touches `src/api.rs`
+3. `prompt-caching.md` — modifies `send_message()` request construction in `src/api.rs` and adds verbose logging in `src/main.rs`
+4. `project-instructions-loading.md` — adds `load_project_instructions()` to `src/main.rs`
+5. `run-turn-refactor.md` — largest change, refactors dispatch paths in `src/main.rs`, should go last</result>
+<usage><total_tokens>87606</total_tokens><tool_uses>16</tool_uses><duration_ms>91384</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/eeeed8f3-a8d1-4311-9281-97af3bad182b/tasks/af1efe7fc8c1f0323.output
+
+---
+
+<task-notification>
+<task-id>a18062d3211811889</task-id>
+<tool-use-id>toolu_01RABnaxzuAeRjzTjMfAgMCQ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/eeeed8f3-a8d1-4311-9281-97af3bad182b/tasks/a18062d3211811889.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit codebase for issues" completed</summary>
+<result>Now I have a thorough understanding of all five files. Here is a complete findings report:
+
+---
+
+## Findings
+
+### src/tools/mod.rs
+
+**1. `grep_exec`: `which rg` spawns a subprocess on every Grep call (Medium)**
+Lines 495-510. The ripgrep availability check uses `Command::new("which").arg("rg")` on every call. This is an unnecessary subprocess fork per search. The result never changes during a session and should be cached (e.g., checked once at startup or lazily with a `OnceLock`). Noted in IMPLEMENTATION_PLAN.md line 111 but still present.
+
+**2. `grep_exec`: `which` is not portable (Low)**
+Line 495. `which` is not available on all systems (notably it is not in POSIX and behaves differently across platforms). `Command::new("rg").arg("--version")` would be more reliable.
+
+**3. `bash_exec`: No output size cap (Medium)**
+Lines 362-365. `output.push_str(&chunk)` accumulates unbounded output until the 120-second timeout. A command that produces several hundred megabytes of output will happily allocate that much heap memory before the tool returns. This can cause OOM in practice. Noted in IMPLEMENTATION_PLAN.md line 113 but still present.
+
+**4. `bash_exec`: Double `child.wait()` after `Disconnected` arm (Medium — latent bug)**
+Lines 382-384 handle `RecvTimeoutError::Disconnected` by calling `child.wait()`. Lines 398-400 then call `child.wait()` again unconditionally after the loop. Calling `wait()` on an already-waited child is defined behavior on Linux/macOS (returns `ECHILD`) but `child.wait()` in Rust's `std::process::Child` documents that it must be called only once or you get an error. The `Err` from the second call is silently swapped away by `?`, so this is a latent error that pollutes the return value on some platforms. The `Disconnected` arm should set a flag and the post-loop wait should be conditional.
+
+**5. `edit_exec`: 100KB size limit only applies to the replace path (Low-Medium)**
+Lines 451-457. The metadata check (`metadata.len() > 102_400`) is placed after the `content = read_to_string` call and only in the non-empty `old_str` branch. The create (empty `old_str` + file missing) and append (empty `old_str` + file exists) paths at lines 429-446 read the file and write new content without any size check at all. A 2GB append target would be fully read into memory. Noted in IMPLEMENTATION_PLAN.md line 112 but still present.
+
+**6. `edit_exec`: Size check after read (Low)**
+Lines 449-457. For the replace path, `read_to_string` (line 449) is called before the metadata/size check (lines 451-457). The file is already fully loaded into memory before the size guard fires. The check should precede the read, mirroring how `read_exec` does it.
+
+**7. `bash_exec`: `description` parameter is schema-declared but never read (Low)**
+Lines 63-68 in the tool schema define a `description` parameter. `bash_exec` (line 284) never reads `input["description"]`. The value is silently discarded. This is cosmetic and documented in IMPLEMENTATION_PLAN.md line 114, but the schema misleads the model into thinking the parameter matters.
+
+**8. `BASH_DENY_LIST`: Bypass-able by minor variation (Low-Medium)**
+Lines 257-268. The deny-list is applied after whitespace normalization and lowercasing, which blocks simple reformatting. However, it cannot block equivalent commands using different syntax: `rm --recursive -f /`, `rm -r -f /`, shell aliases, env-variable expansion (`$HOME` in place of `/`), heredocs, or multi-line scripts. This is a client-side security theater pattern that a sophisticated attacker or confused model can trivially bypass. The guard hooks architecture (in `hooks.rs`) is the correct place for policy enforcement; the deny-list provides a false sense of safety.
+
+**9. `glob_exec`: Sort by modification time is not implemented (Medium)**
+The tool description at line 40 says "sorted by modification time" but `glob_exec` (lines 204-222) does not sort by mtime at all — it simply iterates glob results in filesystem order. The tool schema documentation is incorrect.
+
+**10. `expand_braces`: Only expands the first brace group (Low)**
+Line 237. `pattern.find('{')` finds the first `{`. A pattern like `src/{main,lib}.{rs,toml}` would expand to `["src/main.{rs,toml}", "src/lib.{rs,toml}"]` — the second brace group would not be expanded and would be passed literally to the `glob` crate, which does not support brace expansion. The `glob` crate itself does not support brace expansion at all, so this helper must handle all groups recursively to be correct.
+
+---
+
+### src/hooks.rs
+
+**11. `run_hook_subprocess`: Hook stdout is unbounded (Low-Medium)**
+Lines 461-464. `child.wait_with_output().await` reads all of the hook's stdout into memory with no size limit. A misbehaving hook that writes gigabytes to stdout would exhaust heap. A `take(N)` limit on the stdout before parsing would be appropriate.
+
+**12. `write_observations` / `write_final_state`: TOCTOU race on convergence file (Low)**
+Lines 489-504, 519-534. Both functions read the current file, modify the parsed state in memory, write to a temp file, then `rename`. The read-modify-write is not atomic. If two async tasks call `run_post_tool_use` concurrently (which is possible if post-hook evaluation is interleaved), the second read may observe a stale file, and one set of observations would be lost. In practice the sequential and parallel tool dispatch paths serialize post-dispatch calls, but this is a fragile assumption. A `Mutex` around the convergence file would be cleaner.
+
+**13. `run_hook_subprocess`: Zombie process on timeout (Low-Medium)**
+Lines 442-478. When `tokio::time::timeout` fires, the future is dropped. The spawned `tokio::process::Command` child is dropped too — which sends `SIGKILL` on Unix because `tokio::process::Child` sets `kill_on_drop` by default — but `wait_with_output` was never awaited to completion, so the child's exit status is never collected. The OS entry is cleaned up, but this can produce brief zombie entries visible in `ps`. More importantly, the child's stdin/stdout file descriptors may not be closed before the next hook invocation, potentially stalling subsequent hooks that wait for EOF.
+
+**14. `HookRunner::load`: Silent failure when config is missing vs. malformed (Low)**
+Lines 85-94. Both "file not found" and "bad TOML" produce an empty hook list. The "bad TOML" case prints an error, but "file not found" is silent. This is intentional for the common "no hooks" case, but a misconfigured path (e.g. `hooks.toml` with a typo) would silently run with zero hooks, which is unexpected. At minimum a verbose-mode diagnostic would help.
+
+---
+
+### src/main.rs
+
+**15. `trim_conversation`: O(n²) recomputation on every trim step (Low)**
+Lines 143-154. The inner `new_size` calculation inside the `while` loop re-serializes every remaining message from scratch on every iteration. For a conversation with many large tool results this is quadratic. Incremental size tracking (subtract the removed message's size) would be O(n).
+
+**16. `recover_conversation`: Redundant guard check (Low)**
+Lines 175-206. The function opens with `if messages.len() <= 1 { return; }` and then immediately enters `if messages.len() > 1` (line 179). The inner guard is always true at that point. The function is correct but the pattern is confusing and the outer guard comment is misleading ("never empty the conversation entirely") — the inner paths also preserve at least one message, but the logic isn't obvious.
+
+**17. `stop_reason_str`: Stringly-typed where enums exist (Low)**
+Lines 549, 556, 587, 593, 663, 685, 848-849, 863. `stop_reason_str` is a `&'static str` that carries a value like `"end_turn"`, `"api_error"`, `"convergence_signal"`, etc. The rest of the codebase uses typed `StopReason` and `PostToolResult` enums. A typo in any of these string literals would silently produce incorrect convergence state output. An enum covering all stop reasons and a `to_str()` method would be the consistent approach. Noted in IMPLEMENTATION_PLAN.md line 110.
+
+**18. `MAX_CONTINUATIONS` constant placement (Low)**
+Line 882. `MAX_CONTINUATIONS` is defined 860 lines below the block of constants at lines 15-23. Noted in IMPLEMENTATION_PLAN.md line 109. Not a bug but creates confusion when reading constants.
+
+**19. Parallel path: slot `unwrap()` can panic (Medium — latent bug)**
+Line 780: `slots.into_iter().map(|s| s.unwrap()).collect()`. Each slot is initialized to `None` and set by either the pre-dispatch blocked path (sets `slots[i]`) or `join_spawned_futures`. If `join_spawned_futures` somehow fails to fill a slot (e.g. if a future is not matched to an index), the unwrap panics. In the current code this should not happen, but the invariant is not encoded in the type system — it relies on the `spawn_futures` vec and `slots` vec being kept in sync across two separate loops. A more defensive pattern or using a typed result would eliminate the panic risk.
+
+**20. Parallel path: `threshold_tripped` with partially-filled slots (Medium)**
+Lines 751-781. When `threshold_tripped` is true, the function returns an empty `Vec::new()`. However, `join_spawned_futures` was already called at line 750 and filled some slots. Those completed tool tasks are simply discarded. This is correct behavior (break out cleanly), but the completed tasks' side effects (e.g. files read) already happened. This is acceptable but worth noting: there is no attempt to drain or report results for tasks that completed before the threshold was hit.
+
+**21. `run_turn`: Bash streaming output goes to `/dev/null` on parallel path (Low)**
+Line 336: `dispatch_to_tool_result` passes `&mut |_: &str| {}` as the stream callback. In the sequential path (line 812-816), the `verbose` flag controls whether streaming output is echoed to stderr. In the parallel path, streaming output is always silently discarded regardless of `verbose`. The behavior is inconsistent and the verbose path is less useful for parallel pure tools.
+
+**22. `load_project_instructions`: TOCTOU between `metadata` and `read_to_string` (Very Low)**
+Lines 41-68. `fs::metadata(candidate)` is called, then `fs::read_to_string(candidate)` separately. Between these two calls the file could be deleted or replaced. On failure, the error is caught and reported correctly, so this is not a correctness issue — just an inherent TOCTOU in the pattern.
+
+---
+
+### src/api.rs
+
+**23. `parse_sse_stream`: Silent JSON parse errors swallowed (Low)**
+Line 231: `Err(_) => continue`. If a `data:` line contains malformed JSON that is not `[DONE]`, it is silently skipped. This means a corrupted SSE frame would silently produce an incomplete content block or missing stop_reason. A `StreamParse` error (or at least a log line) would make debugging easier.
+
+**24. `parse_sse_stream`: Buffer grows without bound for very long SSE lines (Low)**
+Lines 216-351. The `buffer` string receives each chunk appended via `push_str` and is drained when a `\n\n` delimiter is found. An SSE line longer than a single chunk (e.g. a very large tool input JSON streamed without a newline in between) would cause `buffer` to grow arbitrarily large before the `\n\n` is found. In practice Anthropic's streaming format always sends newlines, but there is no defensive limit.
+
+**25. `parse_sse_stream`: `content_block_stop` for a non-tool block leaves tool_input_bufs stale (Very Low)**
+Lines 292-312. `tool_input_bufs.remove(&index)` is called, but if the index refers to a text block (not a tool_use), `remove` returns `None` and the inner `if let` simply doesn't execute. This is correct. However, if a `content_block_stop` arrives for a tool block index that was never in `tool_input_bufs` (e.g. due to a missed `content_block_start`), the stop event is silently ignored and the partially-constructed ToolUse block retains its initial empty `input`. This edge case is unlikely but untested.
+
+---
+
+### src/session.rs
+
+**26. `collect_tool_actions`: HashMap iteration order is non-deterministic for `extract_first_arg` (Low)**
+Lines 181-199 in `session.rs`. `serde_json::Map` preserves insertion order (it uses `IndexMap` under the hood), so `extract_first_arg` consistently returns the first-inserted key. The test at line 426 asserts `file_path` is returned first, which works because `serde_json::json!` macro preserves literal order. This is fragile if callers construct inputs differently.
+
+**27. `SessionWriter::new`: Two separate `Utc::now()` calls for session_id date and start_time (Very Low)**
+Lines 45-58. `session_id` is stamped with `Utc::now().format("%Y-%m-%d")` and `start_time` with `Utc::now().to_rfc3339()`. If the two calls straddle midnight (extremely unlikely), the date prefix in the session ID and the timestamp in `start_time` would disagree. A single `now` capture would fix this.
+
+---
+
+### Cargo.toml
+
+**28. `tempfile` pinned to exact version `=3.25.0` (Low)**
+Line 25. The `=3.25.0` exact pin for a dev-dependency is overly restrictive and will cause resolution failures if any other dev-dependency transitively requires a different patch version. Caret (`^3.25`) is the conventional approach unless there is a known regression at a specific version.
+
+**29. No `[profile.release]` configuration (Low)**
+The binary is a single-threaded interactive agent. There is no `[profile.release]` section enabling `opt-level = 3`, LTO, or `strip = true`. These are not bugs but are conventional for a release-intended CLI binary.
+
+---
+
+### Summary by Severity
+
+Medium: 1 (bash unbounded output), 2 (double child.wait), 3 (edit size check order + missing on create/append paths), 4 (parallel path slot unwrap panic), 5 (glob sorted-by-mtime claim is false)
+
+Low-Medium: 6 (which rg per call), 7 (deny-list bypass-able), 8 (hook stdout unbounded), 9 (convergence TOCTOU race), 10 (hook zombie on timeout)
+
+Low: remaining observations (stringly-typed stop reason, MAX_CONTINUATIONS placement, description param, brace expansion single-group limit, O(n²) trim, recover_conversation redundant guard, parallel path discards streaming output, SSE silent JSON skip, session ID midnight edge case, tempfile exact pin)</result>
+<usage><total_tokens>100611</total_tokens><tool_uses>21</tool_uses><duration_ms>143622</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/eeeed8f3-a8d1-4311-9281-97af3bad182b/tasks/a18062d3211811889.output

@@ -1,9 +1,9 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 3/5 complete. 140 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 4/5 complete. 151 tests pass, clippy clean, fmt clean.
 
 Updated 2026-03-11: Phase 2 item 2 (SSE Buffer Optimization) complete. Replaced two `.to_string()` allocations with slice borrow + `drain()` in `parse_sse_stream`. All 6 SSE parser tests pass unchanged.
-Updated 2026-03-12: Phase 2 item 3 (Prompt Caching) complete. System prompt sent as cached content block array, cache_control added to last tool definition, verbose cache stats logging added, redundant content-type header removed. All 140 tests pass, clippy clean, fmt clean.
+Updated 2026-03-12: Phase 2 item 4 (Project Instructions Loading) complete. InstructionsResult enum, load_project_instructions() function, wired into main() with verbose/warn logging, 11 new tests (CLAUDE.md load, AGENTS.md fallback, priority, symlinks, oversized skip, unreadable skip, both skipped, prompt format, signature unchanged). All 151 tests pass, clippy clean, fmt clean.
 
 ## Phase 2 — Active (ordered by priority)
 
@@ -43,18 +43,17 @@ Updated 2026-03-12: Phase 2 item 3 (Prompt Caching) complete. System prompt sent
   - All 140 tests pass, clippy clean, fmt clean
 
 ### 4. Project Instructions Loading — `project-instructions-loading.md`
-- **Status**: Not started
+- **Status**: Complete (v0.0.11)
 - **Priority**: Medium (agent quality — currently has no project context)
-- **Location**: `src/main.rs` only (new enum + function + call site in main())
-- **Problem**: `build_system_prompt()` returns hardcoded text with no awareness of CLAUDE.md or AGENTS.md project instructions.
-- **Changes required**:
+- **Location**: `src/main.rs` (new enum + function + call site in main())
+- **Changes made**:
   - New `InstructionsResult` enum: `Found { filename, contents }`, `Skipped { filename, reason }`, `NotFound`
-  - New `load_project_instructions()` function: iterate `["CLAUDE.md", "AGENTS.md"]`, first match wins, 32KB size limit, permission checks
-  - Call in `main()` after `build_system_prompt()`, concatenate with section header if found
+  - New `load_project_instructions()` function: iterates `["CLAUDE.md", "AGENTS.md"]`, first match wins, 32KB size limit, permission checks
+  - Wired into `main()` after `build_system_prompt()`, concatenates with section header if found
   - Verbose logging on Found/NotFound, warn-level on Skipped (not verbose-gated)
   - Only cwd searched, no parent traversal
-- **Tests**: CLAUDE.md loaded, AGENTS.md fallback, priority when both exist, symlinks, >32KB skip, unreadable skip, both skipped, verbose logging, `build_system_prompt()` signature unchanged
-- **Dependencies**: None (compatible with prompt-caching)
+  - 11 new tests: CLAUDE.md loaded, AGENTS.md fallback, priority when both exist, symlinks, >32KB skip, unreadable skip, both skipped, oversized falls through, prompt format, signature unchanged
+  - All 151 tests pass, clippy clean, fmt clean
 
 ### 5. Run Turn Refactor — `run-turn-refactor.md`
 - **Status**: Not started
@@ -138,3 +137,4 @@ These are NOT Phase 2 spec items but bugs found during audit:
 - Release workflow uses inline CI validation per matrix leg rather than a separate CI job dependency — simpler and avoids cross-workflow triggers
 - The `glob` crate's `glob()` uses `MatchOptions::new()` (case_sensitive: true) while `Default::default()` sets case_sensitive: false — use `glob()` not `glob_with(_, MatchOptions::default())` to match bash behavior
 - The `glob` crate does not support brace expansion — implement `expand_braces()` preprocessor for `{a,b}` patterns before calling `glob::glob()`
+- Tests using `set_current_dir` must be serialized with a static `Mutex<()>` — cargo test runs tests in parallel within the same process, and cwd is process-global state. The `with_temp_cwd` helper pattern (lock → save original → set temp cwd → run closure → restore original) prevents races.

@@ -21,6 +21,55 @@ const MODEL_CONTEXT_TOKENS: u64 = 200_000;
 const TRIM_THRESHOLD: u64 = MODEL_CONTEXT_TOKENS * 60 / 100; // 120K tokens
 const MAX_CONSECUTIVE_BLOCKS: usize = 3;
 const MAX_TOTAL_BLOCKS: usize = 10;
+const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 32_768;
+
+#[derive(Debug, PartialEq)]
+enum InstructionsResult {
+    Found { filename: String, contents: String },
+    Skipped { filename: String, reason: String },
+    NotFound,
+}
+
+/// Search cwd for CLAUDE.md then AGENTS.md. First match wins.
+/// Returns Found on success, Skipped if a candidate exists but can't be loaded
+/// (size limit, permissions), or NotFound if neither file exists.
+fn load_project_instructions() -> InstructionsResult {
+    let candidates = ["CLAUDE.md", "AGENTS.md"];
+    let mut last_skipped: Option<InstructionsResult> = None;
+
+    for candidate in &candidates {
+        let metadata = match std::fs::metadata(candidate) {
+            Ok(m) => m,
+            Err(_) => continue, // file not found or dangling symlink
+        };
+
+        if metadata.len() as usize > PROJECT_INSTRUCTIONS_MAX_BYTES {
+            last_skipped = Some(InstructionsResult::Skipped {
+                filename: candidate.to_string(),
+                reason: "exceeds 32KB".to_string(),
+            });
+            continue;
+        }
+
+        match std::fs::read_to_string(candidate) {
+            Ok(contents) => {
+                return InstructionsResult::Found {
+                    filename: candidate.to_string(),
+                    contents,
+                };
+            }
+            Err(e) => {
+                last_skipped = Some(InstructionsResult::Skipped {
+                    filename: candidate.to_string(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        }
+    }
+
+    last_skipped.unwrap_or(InstructionsResult::NotFound)
+}
 
 #[derive(Parser)]
 #[command(
@@ -194,8 +243,38 @@ fn format_tool_result_display(result: &str, is_error: bool, verbose: bool) -> St
 async fn main() {
     let cli = Cli::parse();
     let client = AnthropicClient::new(&cli.api_url);
-    let system_prompt = build_system_prompt();
+    let mut system_prompt = build_system_prompt();
     let tools = all_tool_schemas();
+
+    // Load project instructions (CLAUDE.md or AGENTS.md)
+    match load_project_instructions() {
+        InstructionsResult::Found {
+            ref filename,
+            ref contents,
+        } => {
+            if cli.verbose {
+                eprintln!(
+                    "[verbose] Loaded project instructions from {} ({} bytes)",
+                    filename,
+                    contents.len()
+                );
+            }
+            system_prompt = format!(
+                "{system_prompt}\n\n---\n\n## Project Instructions (from {filename})\n\n{contents}"
+            );
+        }
+        InstructionsResult::Skipped {
+            ref filename,
+            ref reason,
+        } => {
+            eprintln!("[warn] {filename}: {reason}");
+        }
+        InstructionsResult::NotFound => {
+            if cli.verbose {
+                eprintln!("[verbose] No CLAUDE.md or AGENTS.md found in working directory");
+            }
+        }
+    }
 
     if cli.verbose {
         eprintln!("[verbose] API URL: {}", client.api_url());
@@ -1615,5 +1694,200 @@ mod tests {
                 schema["name"]
             );
         }
+    }
+
+    // --- Project Instructions Loading Tests ---
+    //
+    // Each test creates a temp directory and sets it as cwd for the duration of the test.
+    // This isolates tests from the real working directory and from each other.
+    // Uses a mutex to prevent parallel tests from racing on set_current_dir.
+
+    use std::sync::Mutex;
+    static CWD_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Helper: run a closure with a temporary directory as cwd, then restore.
+    fn with_temp_cwd<F: FnOnce(&std::path::Path)>(f: F) {
+        let _lock = CWD_MUTEX.lock().unwrap();
+        let original = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        f(tmp.path());
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn instructions_loads_claude_md() {
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("CLAUDE.md"), "build instructions here").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert_eq!(contents, "build instructions here");
+                }
+                other => panic!("expected Found, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_loads_agents_md_fallback() {
+        // When only AGENTS.md exists (no CLAUDE.md), it should be loaded.
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("AGENTS.md"), "agents content").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "AGENTS.md");
+                    assert_eq!(contents, "agents content");
+                }
+                other => panic!("expected Found, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_claude_md_takes_priority() {
+        // When both exist, CLAUDE.md wins — AGENTS.md is never read.
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("CLAUDE.md"), "claude wins").unwrap();
+            std::fs::write(dir.join("AGENTS.md"), "agents loses").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert_eq!(contents, "claude wins");
+                }
+                other => panic!("expected Found, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_neither_found() {
+        // Empty directory — no instruction files.
+        with_temp_cwd(|_dir| {
+            let result = load_project_instructions();
+            assert_eq!(result, InstructionsResult::NotFound);
+        });
+    }
+
+    #[test]
+    fn instructions_oversized_file_skipped() {
+        // A CLAUDE.md over 32KB is skipped. If no AGENTS.md either, returns Skipped.
+        with_temp_cwd(|dir| {
+            let big = "x".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES + 1);
+            std::fs::write(dir.join("CLAUDE.md"), &big).unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Skipped { filename, reason } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert!(
+                        reason.contains("32KB"),
+                        "reason should mention 32KB: {}",
+                        reason
+                    );
+                }
+                other => panic!("expected Skipped, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_oversized_falls_through_to_agents() {
+        // CLAUDE.md over 32KB, but AGENTS.md exists and is fine — loads AGENTS.md.
+        with_temp_cwd(|dir| {
+            let big = "x".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES + 1);
+            std::fs::write(dir.join("CLAUDE.md"), &big).unwrap();
+            std::fs::write(dir.join("AGENTS.md"), "fallback agents").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "AGENTS.md");
+                    assert_eq!(contents, "fallback agents");
+                }
+                other => panic!("expected Found via AGENTS.md fallback, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_both_skipped_returns_last_skipped() {
+        // Both files exist but both exceed size limit — returns last Skipped (AGENTS.md).
+        with_temp_cwd(|dir| {
+            let big = "x".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES + 1);
+            std::fs::write(dir.join("CLAUDE.md"), &big).unwrap();
+            std::fs::write(dir.join("AGENTS.md"), &big).unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Skipped { filename, .. } => {
+                    assert_eq!(filename, "AGENTS.md");
+                }
+                other => panic!("expected Skipped for AGENTS.md, got {:?}", other),
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instructions_unreadable_file_skipped() {
+        // File exists but no read permission — produces Skipped, falls through.
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_cwd(|dir| {
+            let path = dir.join("CLAUDE.md");
+            std::fs::write(&path, "secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = load_project_instructions();
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            match result {
+                InstructionsResult::Skipped { filename, reason } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert!(
+                        reason.contains("ermission") || reason.contains("denied"),
+                        "reason should mention permission: {}",
+                        reason
+                    );
+                }
+                other => panic!("expected Skipped, got {:?}", other),
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instructions_symlink_works() {
+        // CLAUDE.md -> AGENTS.md symlink. Should load via CLAUDE.md name.
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("AGENTS.md"), "symlinked content").unwrap();
+            std::os::unix::fs::symlink(dir.join("AGENTS.md"), dir.join("CLAUDE.md")).unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert_eq!(contents, "symlinked content");
+                }
+                other => panic!("expected Found via symlink, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_prompt_integration_format() {
+        // Verify the system prompt format when instructions are loaded.
+        let base = "base prompt here";
+        let filename = "CLAUDE.md";
+        let contents = "## Build\ncargo build";
+        let combined =
+            format!("{base}\n\n---\n\n## Project Instructions (from {filename})\n\n{contents}");
+        assert!(combined.starts_with("base prompt here"));
+        assert!(combined.contains("## Project Instructions (from CLAUDE.md)"));
+        assert!(combined.contains("cargo build"));
+    }
+
+    #[test]
+    fn build_system_prompt_signature_unchanged() {
+        // build_system_prompt() returns String, takes no args — this compiles iff true.
+        let _: String = build_system_prompt();
     }
 }

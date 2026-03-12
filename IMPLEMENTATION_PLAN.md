@@ -1,9 +1,12 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 4/5 complete. 151 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. 153 tests pass, clippy clean, fmt clean.
+
+All planned work is complete.
 
 Updated 2026-03-11: Phase 2 item 2 (SSE Buffer Optimization) complete. Replaced two `.to_string()` allocations with slice borrow + `drain()` in `parse_sse_stream`. All 6 SSE parser tests pass unchanged.
 Updated 2026-03-12: Phase 2 item 4 (Project Instructions Loading) complete. InstructionsResult enum, load_project_instructions() function, wired into main() with verbose/warn logging, 11 new tests (CLAUDE.md load, AGENTS.md fallback, priority, symlinks, oversized skip, unreadable skip, both skipped, prompt format, signature unchanged). All 151 tests pass, clippy clean, fmt clean.
+Updated 2026-03-12: Phase 2 item 5 (Run Turn Refactor) complete. Extracted run_pre_dispatch() and run_post_dispatch() from duplicated parallel/sequential paths. Fixed two pre-existing bugs: null-input silent skip in sequential path now produces error ToolResult, null-input in parallel path now sets blocked_flags preventing spurious post-hooks. run_turn reduced from 479 to 349 lines. 2 new tests (pre_dispatch_null_input, pre_dispatch_allow_resets). All 153 tests pass, clippy clean, fmt clean.
 
 ## Phase 2 — Active (ordered by priority)
 
@@ -56,28 +59,30 @@ Updated 2026-03-12: Phase 2 item 4 (Project Instructions Loading) complete. Inst
   - All 151 tests pass, clippy clean, fmt clean
 
 ### 5. Run Turn Refactor — `run-turn-refactor.md`
-- **Status**: Not started
+- **Status**: Complete (v0.0.12)
 - **Priority**: Medium (structural debt + 2 bug fixes)
 - **Location**: `src/main.rs` run_turn (lines 301-779, currently 479 lines, target <350)
 - **Problem**: Parallel and sequential dispatch paths duplicate pre-hook/post-hook/threshold/null-input logic. Two pre-existing bugs:
   - **Bug 1** (line 668-670): Sequential path silently `continue`s on null-input tools — no ToolResult produced, violating API's tool_use/tool_result pairing requirement
   - **Bug 2** (line 509-519): Parallel path doesn't set `blocked_flags[i]` for null-input tools, causing post-hooks to fire on fabricated error results for tools that never executed
-- **Changes required**:
-  - Extract `run_pre_dispatch()` → returns `PreDispatchResult` enum (`Allow`, `Blocked(ContentBlock)`, `ThresholdTripped`)
-  - Extract `run_post_dispatch()` → returns `bool` (signal_break)
-  - Both bugs fixed by unified null-input handling in `run_pre_dispatch`
-  - Parallel path: pre-dispatch loop → join_all → post-dispatch loop (skip blocked)
-  - Sequential path: interleaved loop (pre-dispatch → dispatch → post-dispatch)
-  - `dispatch_tool` call itself NOT extracted (parallel=spawn_blocking, sequential=streaming callback — fundamental asymmetry)
-- **Tests**: All 119 existing tests must pass with zero modification, clippy clean, run_turn under 350 lines
-- **Dependencies**: None, but implement last (largest change surface, touches same code as items 3-4)
+- **Changes made**:
+  - Extracted `run_pre_dispatch()` → `PreDispatchResult` enum (`Allow`, `Blocked(ContentBlock)`, `ThresholdTripped`)
+  - Extracted `run_post_dispatch()` → returns `bool` (signal_break)
+  - Extracted `dispatch_to_tool_result()` for parallel path spawn_blocking
+  - Extracted `join_spawned_futures()` for parallel join_all + panic handling
+  - Extracted `log_tool_dispatch()` and `threshold_reason_str()` helpers
+  - Bug 1 fixed: sequential null-input now returns Blocked with error ToolResult
+  - Bug 2 fixed: parallel null-input now sets blocked_flags, post-hooks skipped
+  - run_turn: 479 → 349 lines (under 350 target)
+  - 2 new tests: pre_dispatch_null_input_returns_blocked_error, pre_dispatch_allow_resets_consecutive_block_count
+  - All 153 tests pass, clippy clean, fmt clean
 
 ## Pre-existing Bugs (confirmed via code search)
 
 These are NOT Phase 2 spec items but bugs found during audit:
 
-1. **Null-input silent skip in sequential path** (`main.rs:668-670`): `continue` produces no ToolResult. The API expects a tool_result for every tool_use. Fixed by item 5.
-2. **Missing blocked_flags for null-input in parallel path** (`main.rs:513-519`): Post-hooks fire on error results for tools that never executed. Fixed by item 5.
+1. **Null-input silent skip in sequential path** (`main.rs:668-670`): `continue` produces no ToolResult. The API expects a tool_result for every tool_use. Fixed by item 5 (v0.0.12).
+2. **Missing blocked_flags for null-input in parallel path** (`main.rs:513-519`): Post-hooks fire on error results for tools that never executed. Fixed by item 5 (v0.0.12).
 3. **Tool input JSON parse failure silently swallowed** (`api.rs:291-295`): `if let Ok(v)` silently drops parse errors, leaving ToolUse with `input: {}`. Not addressed by any spec.
 4. **`recover_conversation` can empty the conversation** (`main.rs:139-145`): Cascading pops have no minimum-length guard. Not addressed by any spec.
 

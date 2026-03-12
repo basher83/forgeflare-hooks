@@ -38,6 +38,12 @@
       "transcript": "/20/0d625e99dc/4/full.jsonl",
       "content_hash": "/20/0d625e99dc/4/content_hash.txt",
       "prompt": ""
+    },
+    {
+      "metadata": "/20/0d625e99dc/5/metadata.json",
+      "transcript": "/20/0d625e99dc/5/full.jsonl",
+      "content_hash": "/20/0d625e99dc/5/content_hash.txt",
+      "prompt": ""
     }
   ],
   "token_usage": {

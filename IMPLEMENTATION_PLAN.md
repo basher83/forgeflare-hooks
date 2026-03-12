@@ -1,8 +1,8 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 1/5 complete. 135 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 2/5 complete. 135 tests pass, clippy clean, fmt clean.
 
-Updated 2026-03-11: Phase 2 item 1 (Glob Shell Injection) complete. All 4 remaining specs confirmed absent from codebase. Two pre-existing bugs remain in `run_turn` (fixed by item 5).
+Updated 2026-03-11: Phase 2 item 2 (SSE Buffer Optimization) complete. Replaced two `.to_string()` allocations with slice borrow + `drain()` in `parse_sse_stream`. All 6 SSE parser tests pass unchanged.
 
 ## Phase 2 — Active (ordered by priority)
 
@@ -20,18 +20,14 @@ Updated 2026-03-11: Phase 2 item 1 (Glob Shell Injection) complete. All 4 remain
   - All 135 tests pass, clippy clean, fmt clean
 
 ### 2. SSE Buffer Optimization — `sse-buffer-optimization.md`
-- **Status**: Not started
+- **Status**: Complete (v0.0.9)
 - **Priority**: Low (correctness OK, performance improvement)
-- **Location**: `src/api.rs` parse_sse_stream (lines 213-214)
-- **Problem**: Two unnecessary String allocations per SSE event in the extraction loop:
-  - Line 213: `buffer[..pos].to_string()` — copies event block to new String
-  - Line 214: `buffer[pos + 2..].to_string()` — copies remainder to new String (O(N*M) total work)
-- **Changes required**:
-  - Replace line 213 with `let event_block = &buffer[..pos];` (borrow, no alloc) inside a scoped block
-  - Replace line 214 with `buffer.drain(..pos + 2);` (in-place memmove)
-  - Scoped block required: borrow checker needs `event_block` dropped before `drain` mutates `buffer`
-- **Tests**: All 6 existing SSE parser tests must pass unchanged (no new tests needed)
-- **Dependencies**: None
+- **Location**: `src/api.rs` parse_sse_stream
+- **Changes made**:
+  - Replaced `buffer[..pos].to_string()` with `&buffer[..pos]` (slice borrow, zero allocation)
+  - Replaced `buffer = buffer[pos + 2..].to_string()` with `buffer.drain(..pos + 2)` (in-place memmove)
+  - Scoped block `{ }` around the slice borrow so the borrow is dropped before `drain` mutates `buffer`
+  - All 135 tests pass, clippy clean, fmt clean
 
 ### 3. Prompt Caching — `prompt-caching.md`
 - **Status**: Not started

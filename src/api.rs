@@ -210,127 +210,131 @@ where
 
         // Process complete SSE lines
         while let Some(pos) = buffer.find("\n\n") {
-            let event_block = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
+            {
+                let event_block = &buffer[..pos];
 
-            for line in event_block.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        continue;
-                    }
-
-                    let parsed: serde_json::Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let event_type = parsed["type"].as_str().unwrap_or("");
-
-                    match event_type {
-                        "message_start" => {
-                            if let Some(u) = parsed.get("message").and_then(|m| m.get("usage")) {
-                                usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
-                                usage.cache_creation_input_tokens =
-                                    u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                                usage.cache_read_input_tokens =
-                                    u["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                            }
+                for line in event_block.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data == "[DONE]" {
+                            continue;
                         }
-                        "content_block_start" => {
-                            let cb = &parsed["content_block"];
-                            match cb["type"].as_str() {
-                                Some("text") => {
-                                    content_blocks.push(ContentBlock::Text {
-                                        text: String::new(),
-                                    });
+
+                        let parsed: serde_json::Value = match serde_json::from_str(data) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        let event_type = parsed["type"].as_str().unwrap_or("");
+
+                        match event_type {
+                            "message_start" => {
+                                if let Some(u) = parsed.get("message").and_then(|m| m.get("usage"))
+                                {
+                                    usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+                                    usage.cache_creation_input_tokens =
+                                        u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                                    usage.cache_read_input_tokens =
+                                        u["cache_read_input_tokens"].as_u64().unwrap_or(0);
                                 }
-                                Some("tool_use") => {
-                                    let idx = content_blocks.len();
-                                    content_blocks.push(ContentBlock::ToolUse {
+                            }
+                            "content_block_start" => {
+                                let cb = &parsed["content_block"];
+                                match cb["type"].as_str() {
+                                    Some("text") => {
+                                        content_blocks.push(ContentBlock::Text {
+                                            text: String::new(),
+                                        });
+                                    }
+                                    Some("tool_use") => {
+                                        let idx = content_blocks.len();
+                                        content_blocks.push(ContentBlock::ToolUse {
                                         id: cb["id"].as_str().unwrap_or("").to_string(),
                                         name: cb["name"].as_str().unwrap_or("").to_string(),
                                         input: serde_json::Value::Object(serde_json::Map::new()),
                                     });
-                                    tool_input_bufs.insert(idx, String::new());
+                                        tool_input_bufs.insert(idx, String::new());
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                        "content_block_delta" => {
-                            let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-                            let delta = &parsed["delta"];
+                            "content_block_delta" => {
+                                let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                                let delta = &parsed["delta"];
 
-                            match delta["type"].as_str() {
-                                Some("text_delta") => {
-                                    if let Some(text) = delta["text"].as_str() {
-                                        callback(text);
-                                        if let Some(ContentBlock::Text { text: ref mut t }) =
-                                            content_blocks.get_mut(index)
-                                        {
-                                            t.push_str(text);
+                                match delta["type"].as_str() {
+                                    Some("text_delta") => {
+                                        if let Some(text) = delta["text"].as_str() {
+                                            callback(text);
+                                            if let Some(ContentBlock::Text { text: ref mut t }) =
+                                                content_blocks.get_mut(index)
+                                            {
+                                                t.push_str(text);
+                                            }
                                         }
                                     }
-                                }
-                                Some("input_json_delta") => {
-                                    if let Some(partial) = delta["partial_json"].as_str() {
-                                        if let Some(buf) = tool_input_bufs.get_mut(&index) {
-                                            buf.push_str(partial);
+                                    Some("input_json_delta") => {
+                                        if let Some(partial) = delta["partial_json"].as_str() {
+                                            if let Some(buf) = tool_input_bufs.get_mut(&index) {
+                                                buf.push_str(partial);
+                                            }
                                         }
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                        "content_block_stop" => {
-                            let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-                            // Finalize tool_use input JSON
-                            if let Some(json_str) = tool_input_bufs.remove(&index) {
-                                if let Some(ContentBlock::ToolUse { ref mut input, .. }) =
-                                    content_blocks.get_mut(index)
-                                {
-                                    if let Ok(v) =
-                                        serde_json::from_str::<serde_json::Value>(&json_str)
+                            "content_block_stop" => {
+                                let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                                // Finalize tool_use input JSON
+                                if let Some(json_str) = tool_input_bufs.remove(&index) {
+                                    if let Some(ContentBlock::ToolUse { ref mut input, .. }) =
+                                        content_blocks.get_mut(index)
                                     {
-                                        *input = v;
+                                        if let Ok(v) =
+                                            serde_json::from_str::<serde_json::Value>(&json_str)
+                                        {
+                                            *input = v;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        "message_delta" => {
-                            if let Some(sr) = parsed["delta"]["stop_reason"].as_str() {
-                                stop_reason = match sr {
-                                    "end_turn" => Some(StopReason::EndTurn),
-                                    "max_tokens" => Some(StopReason::MaxTokens),
-                                    "tool_use" => Some(StopReason::ToolUse),
-                                    _ => None,
-                                };
-                            }
-                            if let Some(u) = parsed.get("usage") {
-                                usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
-                            }
-                        }
-                        "error" => {
-                            let err_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
-                            let err_msg = parsed["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
-                            match err_type {
-                                "overloaded_error" | "api_error" | "rate_limit_error" => {
-                                    return Err(AgentError::StreamTransient(format!(
-                                        "{err_type}: {err_msg}"
-                                    )));
+                            "message_delta" => {
+                                if let Some(sr) = parsed["delta"]["stop_reason"].as_str() {
+                                    stop_reason = match sr {
+                                        "end_turn" => Some(StopReason::EndTurn),
+                                        "max_tokens" => Some(StopReason::MaxTokens),
+                                        "tool_use" => Some(StopReason::ToolUse),
+                                        _ => None,
+                                    };
                                 }
-                                _ => {
-                                    return Err(AgentError::StreamParse(format!(
-                                        "{err_type}: {err_msg}"
-                                    )));
+                                if let Some(u) = parsed.get("usage") {
+                                    usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
                                 }
                             }
+                            "error" => {
+                                let err_type =
+                                    parsed["error"]["type"].as_str().unwrap_or("unknown");
+                                let err_msg = parsed["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("unknown error");
+                                match err_type {
+                                    "overloaded_error" | "api_error" | "rate_limit_error" => {
+                                        return Err(AgentError::StreamTransient(format!(
+                                            "{err_type}: {err_msg}"
+                                        )));
+                                    }
+                                    _ => {
+                                        return Err(AgentError::StreamParse(format!(
+                                            "{err_type}: {err_msg}"
+                                        )));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
+            buffer.drain(..pos + 2);
         }
     }
 

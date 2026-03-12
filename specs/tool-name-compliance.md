@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # Tool Name Compliance Specification
 
-**Status:** Active
 **Target:** Rename forgeflare's tool names to match Claude Code conventions for OAuth proxy compatibility
 
 ---

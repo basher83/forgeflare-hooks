@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # Unified Rust Coding Agent Specification
 
-**Status:** Active
 **Target:** Single binary, streaming, subagent-aware, <950 production lines
 **Pin:** Go source at `/reference/go-source/` — pattern-match against working code
 

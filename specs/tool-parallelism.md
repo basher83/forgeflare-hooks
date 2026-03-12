@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # Parallel Dispatch for Pure Tools
 
-**Status:** Active
 **Target:** Classify tools by side effects and execute read-only tools concurrently within a single tool batch
 
 ---

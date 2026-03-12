@@ -1,25 +1,59 @@
 # Implementation Plan
 
-All 9 items complete. 119 tests pass, clippy clean, fmt clean. Binary compiles, all 5 tools work with PascalCase names.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 15/15 fixed. 179 tests pass, clippy clean, fmt clean.
 
-Updated 2026-02-14: Fixed convergence JSON key from "final_state" to "final" per hooks.md spec (serde rename was missing). Added regression test asserting raw JSON key name.
+All planned work is complete.
 
-## Completed Items
+Updated 2026-03-12: Full spec-vs-implementation audit across all 16 specs. Three gaps found and fixed: (1) release workflow missing `--latest` flag (spec R4, v0.0.16); (2) actions/checkout SHA mismatch between ci.yml and release.yml (spec R6, v0.0.16); (3) unknown SSE error types classified as permanent instead of transient (api-retry spec R1, v0.0.17).
 
-1. Foundation: `coding-agent.md` + `tool-name-compliance.md` — CLI, streaming API, 5 PascalCase tools
-2. API Endpoint Configuration: `api-endpoint.md` — configurable URL, optional API key
-3. API Retry: `api-retry.md` — exponential backoff, error classification
-4. Session Capture: `session-capture.md` — JSONL transcripts, usage parsing
-5. MaxTokens Continuation: `maxtoken-continuation.md` — 3-attempt cap, classify_max_tokens
-6. Token-Aware Trim: `token-aware-trim.md` — 120K threshold gating
-7. Tool Parallelism: `tool-parallelism.md` — ToolEffect enum, batch classification
-8. Hook Dispatch: `hooks.md` — guard/observe/post/stop, fail-closed guards, convergence writes
-9. Release Workflow: `release-workflow.md` — tag-triggered, macOS aarch64 + Linux x86_64, pinned SHAs
+Updated 2026-03-12: Second audit pass found two test coverage gaps in parallel dispatch path. Both fixed in v0.0.19: (1) null-input tool_use in parallel path — test verifies error ToolResult produced and post-hooks skipped via blocked_flags; (2) mid-batch threshold trip — test verifies already-spawned futures joined, threshold_tripped set, and empty result returned.
 
-## Spec Errata (documented during implementation)
+Updated 2026-03-12: Third audit pass (v0.0.21). Four issues found and fixed: (1) Cargo.toml version was `0.1.0` while git tags were `v0.0.x` — session transcripts via `env!("CARGO_PKG_VERSION")` were lying. Fixed to `0.0.21`. (2) Missing test for Stop hook returning unrecognized action value (hooks.md R3). Added `stop_unrecognized_action_does_not_panic`. (3) Missing test for `threshold_tripped` precedence over `signal_break` (hooks.md R6). Added `threshold_takes_precedence_over_signal_break`. (4) glob-shell-injection.md R2 incorrectly stated glob crate returns "filesystem order (platform-dependent)" — corrected to "alphabetical order" per implementation notes.
 
-- `release-workflow.md` line 77: success criteria says "working `agent` binary" — should say `forgeflare`. The workflow correctly uses `forgeflare`.
-- `session-capture.md` JSONL example (line 101): uses snake_case `read_file` in tool_use name. Should be PascalCase `Read` per `tool-name-compliance.md`. Cosmetic only.
+Updated 2026-03-12: Fourth audit pass (v0.0.22). Full spec-vs-implementation test coverage audit. Four new tests added: (1) SSE error with absent `error.type` field defaults to transient (api-retry R1). (2) Brace expansion producing invalid pattern fails the entire glob operation (glob-shell-injection R5). (3) Convergence write failure returns Err without panic (hooks R8, unix-only). (4) Guard-hook blocked tools skip PostToolUse via blocked_flags (hooks R7).
+
+Updated 2026-03-12: Fifth audit pass (v0.0.23). Boundary and edge-case coverage audit. Seven new tests added: (1) `trim_conversation_preserves_first_message_content` — asserts first message content is byte-identical after trim (not just length check). (2) `recover_conversation_two_messages_trailing_user` — boundary: exactly 2 messages with trailing user gets popped to 1. (3) `recover_conversation_two_messages_trailing_assistant` — boundary: exactly 2 messages with trailing assistant stays at 2. (4) `edit_replace_all_zero_matches_returns_error` — `replace_all=true` with 0 matches returns Err, file unchanged. (5) `glob_path_trailing_slash_works` — `path="src/"` with trailing slash works (double-slash tolerant). (6) `read_exactly_1mb_succeeds` — boundary: exactly 1MB allowed, 1MB+1 rejected (strict greater-than guard). (7) `parse_sse_empty_data_line_skipped` — empty `data: ` payload silently skipped, subsequent events parsed correctly.
+
+## Spec Audit Results (2026-03-12)
+
+Full line-by-line audit of all specs against implementation. Results:
+
+- `coding-agent.md` — Fully implemented. Two intentional deviations documented below.
+- `tool-name-compliance.md` — No gaps.
+- `api-endpoint.md` — No gaps. Three-tier URL precedence, conditional API key, trailing slash strip.
+- `api-retry.md` — One gap fixed: unknown SSE error types defaulted to permanent (`StreamParse`) instead of transient (`StreamTransient`). Now only `invalid_request_error` is permanent; all others trigger retry (v0.0.17).
+- `session-capture.md` — No gaps. JSONL transcripts, usage parsing, session identity.
+- `token-aware-trim.md` — No gaps. 120K threshold gating, byte-based fallback.
+- `maxtoken-continuation.md` — No gaps. 3-attempt cap, classify_max_tokens enum.
+- `tool-parallelism.md` — No gaps. ToolEffect enum, batch classification, parallel dispatch.
+- `hooks.md` — No gaps. All four phases, fail-closed guards, convergence writes, block thresholds.
+- `glob-shell-injection.md` — No gaps. Pure glob crate, no shell subprocess.
+- `sse-buffer-optimization.md` — No gaps. Slice borrow + drain.
+- `prompt-caching.md` — No gaps. System prompt + last tool cache_control.
+- `project-instructions-loading.md` — No gaps. CLAUDE.md/AGENTS.md with priority, size limit, permission checks.
+- `run-turn-refactor.md` — No gaps. Extracted helpers, both bug fixes, under 350 lines.
+- `release-workflow.md` — Two gaps fixed: `--latest` flag added to `gh release create` (v0.0.16); `actions/checkout` SHA aligned with ci.yml (v0.0.16).
+
+## Known Untestable Gaps
+
+- `classify_error` for `AgentError::Api(reqwest::Error)` timeout/connect branches: constructing a `reqwest::Error` requires actual network failures. The error classification logic is correct by inspection, but these specific branches have no unit test. Accepted constraint — not worth introducing a mock HTTP layer for two match arms.
+
+- `coding-agent.md` R4 lists `Glob(path?, recursive?)` — `recursive` parameter not implemented. The `glob` crate handles `**` patterns natively, making an explicit parameter redundant. The model uses `**/*.rs` directly.
+- `coding-agent.md` R4 lists `Bash(command, cwd?)` — `cwd` parameter not implemented. The model uses `cd dir && command` pattern. Claude Code itself omits this parameter.
+- Bash schema declares a `description` parameter that `bash_exec` never reads. Harmless — the model sends it for context but the tool ignores it. Not worth removing since it serves as documentation in the schema.
+
+## Spec Errata
+
+- `release-workflow.md` line 77: success criteria says "working `agent` binary" — should say `forgeflare`.
+- `session-capture.md` JSONL example (line 101): uses snake_case `read_file` in tool_use name. Should be PascalCase `Read` per `tool-name-compliance.md`.
+- `glob-shell-injection.md` R2: said "filesystem order (platform-dependent)" — corrected to "alphabetical order" (v0.0.21).
+
+## Minor Code Observations (not blocking)
+
+All resolved in v0.0.18:
+- `classify_effect` naming mismatch — stale note, CLAUDE.md does not reference this name.
+- `MAX_CONTINUATIONS` constant moved to top-of-file constants block.
+- `stop_reason_str` replaced with typed `TurnStopReason` enum.
 
 ## Learnings
 
@@ -48,3 +82,9 @@ Updated 2026-02-14: Fixed convergence JSON key from "final_state" to "final" per
 - tokio::process::Command needs explicit stdin close (drop after write_all) for hooks to receive EOF and produce output
 - Hook subprocess execution wraps spawn-write-read in tokio::time::timeout — the timeout covers the entire sequence, not just individual operations
 - Release workflow uses inline CI validation per matrix leg rather than a separate CI job dependency — simpler and avoids cross-workflow triggers
+- The `glob` crate's `glob()` uses `MatchOptions::new()` (case_sensitive: true) while `Default::default()` sets case_sensitive: false — use `glob()` not `glob_with(_, MatchOptions::default())` to match bash behavior
+- The `glob` crate does not support brace expansion — implement `expand_braces()` preprocessor for `{a,b}` patterns before calling `glob::glob()`
+- Tests using `set_current_dir` must be serialized with a static `Mutex<()>` — cargo test runs tests in parallel within the same process, and cwd is process-global state. The `with_temp_cwd` helper pattern (lock → save original → set temp cwd → run closure → restore original) prevents races.
+- `std::sync::OnceLock` (Rust 1.70+) is ideal for caching one-time subprocess checks — thread-safe lazy initialization without external dependencies
+- `str::floor_char_boundary()` (Rust 1.73+) safely truncates strings at char boundaries — avoids panics when slicing multi-byte UTF-8 in output cap logic
+- Bash deny list matches on normalized (lowercased, whitespace-collapsed) command strings — test commands for output cap must avoid matching deny patterns (e.g. `dd if=/dev` triggers the deny list)

@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # API Retry for Transient Failures
 
-**Status:** Active
 **Target:** Retry transient API errors (429, 503, 529, network timeouts) with exponential backoff instead of breaking the inner loop
 
 ---

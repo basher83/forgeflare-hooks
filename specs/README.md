@@ -2,11 +2,11 @@
 
 | Status | Spec | Purpose | Code Location |
 |--------|------|---------|---------------|
-| Active | `glob-shell-injection.md` | Replace shell injection in glob_exec with glob crate | `src/tools/mod.rs` |
-| Active | `prompt-caching.md` | Add cache_control to system prompt and tools for prompt caching | `src/api.rs` |
-| Active | `project-instructions-loading.md` | Load CLAUDE.md project instructions into system prompt | `src/main.rs` |
-| Active | `run-turn-refactor.md` | Extract shared dispatch logic from parallel/sequential paths | `src/main.rs` |
-| Active | `sse-buffer-optimization.md` | Eliminate unnecessary String reallocation in SSE parser | `src/api.rs` |
+| Complete | `glob-shell-injection.md` | Replace shell injection in glob_exec with glob crate | `src/tools/mod.rs` |
+| Complete | `prompt-caching.md` | Add cache_control to system prompt and tools for prompt caching | `src/api.rs` |
+| Complete | `project-instructions-loading.md` | Load CLAUDE.md project instructions into system prompt | `src/main.rs` |
+| Complete | `run-turn-refactor.md` | Extract shared dispatch logic from parallel/sequential paths | `src/main.rs` |
+| Complete | `sse-buffer-optimization.md` | Eliminate unnecessary String reallocation in SSE parser | `src/api.rs` |
 | Complete | `coding-agent.md` | Unified Rust agent: single binary, streaming, 5 tools, <950 lines | `src/` |
 | Complete | `release-workflow.md` | Cross-platform release builds: macOS aarch64 + Linux x86_64, tag-triggered, tarballs | `.github/workflows/release.yml` |
 | Complete | `session-capture.md` | Persist conversation transcripts in Entire-compatible JSONL for post-session observability | `src/session.rs` + `.entire/metadata/` |

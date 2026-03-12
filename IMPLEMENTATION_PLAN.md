@@ -1,8 +1,9 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 2/5 complete. 135 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 3/5 complete. 140 tests pass, clippy clean, fmt clean.
 
 Updated 2026-03-11: Phase 2 item 2 (SSE Buffer Optimization) complete. Replaced two `.to_string()` allocations with slice borrow + `drain()` in `parse_sse_stream`. All 6 SSE parser tests pass unchanged.
+Updated 2026-03-12: Phase 2 item 3 (Prompt Caching) complete. System prompt sent as cached content block array, cache_control added to last tool definition, verbose cache stats logging added, redundant content-type header removed. All 140 tests pass, clippy clean, fmt clean.
 
 ## Phase 2 — Active (ordered by priority)
 
@@ -30,18 +31,16 @@ Updated 2026-03-11: Phase 2 item 2 (SSE Buffer Optimization) complete. Replaced 
   - All 135 tests pass, clippy clean, fmt clean
 
 ### 3. Prompt Caching — `prompt-caching.md`
-- **Status**: Not started
+- **Status**: Complete (v0.0.10)
 - **Priority**: Medium (cost reduction — response-side infrastructure already exists)
 - **Location**: `src/api.rs` send_message (lines 140-150), `src/main.rs` run_turn (~line 418)
-- **Problem**: Every API call re-sends full system prompt as plain string and all tool definitions at full token cost. `Usage` already tracks `cache_creation_input_tokens` and `cache_read_input_tokens`, and the SSE parser extracts them — only the request side is missing.
-- **Changes required**:
-  - `send_message`: Replace `"system": system` (line 143) with content block array containing `cache_control: {"type": "ephemeral"}`
-  - `send_message`: Clone tools array, add `cache_control` to last tool only (API caches everything up to marked block)
-  - `run_turn`: Add verbose cache logging after usage destructuring
-  - No signature changes to `send_message`
-- **Tests**: Verify system prompt sent as content block array, last tool has cache_control, verbose mode logs cache stats
-- **Dependencies**: None (compatible with project-instructions-loading — both share `system: &str` interface)
-- **Note**: Redundant `content-type` header at line 155 is overwritten by `.json()` at line 162 — consider removing as cleanup
+- **Changes made**:
+  - System prompt sent as content block array with `cache_control: {"type": "ephemeral"}`
+  - Last tool definition gets `cache_control` at send time (schemas unmodified)
+  - Verbose cache stats logging: read, created, total input
+  - Removed redundant `content-type` header (overwritten by `.json()`)
+  - 5 new tests: system prompt format, last-tool-only cache_control, single tool, empty tools, tool schemas have no cache_control
+  - All 140 tests pass, clippy clean, fmt clean
 
 ### 4. Project Instructions Loading — `project-instructions-loading.md`
 - **Status**: Not started
@@ -102,7 +101,6 @@ These are NOT Phase 2 spec items but bugs found during audit:
 
 ## Minor Code Observations (not blocking, no spec needed)
 
-- `content-type` header explicitly set at `api.rs:155` is overwritten by `.json()` at line 162 (redundant)
 - `tool_effect` function name in code vs `classify_effect` in CLAUDE.md (naming mismatch, cosmetic)
 - `MAX_CONTINUATIONS` constant defined at `main.rs:790`, separated from other constants at lines 15-23
 - `stop_reason_str` is stringly-typed (`&str`) where the rest of the codebase uses typed enums

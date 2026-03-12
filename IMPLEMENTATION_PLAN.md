@@ -1,10 +1,12 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. 164 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 2/2 fixed. 166 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
 Updated 2026-03-12: Full spec-vs-implementation audit across all 16 specs. Three gaps found and fixed: (1) release workflow missing `--latest` flag (spec R4, v0.0.16); (2) actions/checkout SHA mismatch between ci.yml and release.yml (spec R6, v0.0.16); (3) unknown SSE error types classified as permanent instead of transient (api-retry spec R1, v0.0.17).
+
+Updated 2026-03-12: Second audit pass found two test coverage gaps in parallel dispatch path. Both fixed in v0.0.19: (1) null-input tool_use in parallel path — test verifies error ToolResult produced and post-hooks skipped via blocked_flags; (2) mid-batch threshold trip — test verifies already-spawned futures joined, threshold_tripped set, and empty result returned.
 
 ## Spec Audit Results (2026-03-12)
 

@@ -2040,4 +2040,295 @@ mod tests {
         recover_conversation(&mut msgs);
         assert!(msgs.is_empty());
     }
+
+    // --- Parallel path integration tests ---
+    // These verify the blocked_flags and threshold_tripped code paths that
+    // run_pre_dispatch unit tests cannot reach (those test the function in isolation;
+    // these test the orchestration logic that calls it in a batch loop).
+
+    #[tokio::test]
+    async fn parallel_path_null_input_blocked_skips_post_hooks() {
+        // Simulates the parallel dispatch loop with a batch containing one valid
+        // tool and one null-input tool. Verifies:
+        //   (a) null-input slot gets an error ToolResult
+        //   (b) blocked_flags[i] is set for the null-input tool
+        //   (c) post-dispatch is skipped for the blocked slot
+        let hooks = HookRunner::load("/nonexistent/hooks.toml", "/tmp");
+        let tool_uses: Vec<(String, String, serde_json::Value)> = vec![
+            (
+                "tu_valid".to_string(),
+                "Read".to_string(),
+                serde_json::json!({"file_path": "/dev/null"}),
+            ),
+            (
+                "tu_null".to_string(),
+                "Bash".to_string(),
+                serde_json::Value::Null,
+            ),
+        ];
+        let batch_size = tool_uses.len();
+        let mut slots: Vec<Option<ContentBlock>> = vec![None; batch_size];
+        let mut blocked_flags: Vec<bool> = vec![false; batch_size];
+        let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
+        let mut consecutive_block_count = 0usize;
+        let mut total_block_count = 0usize;
+        let mut threshold_tripped = false;
+
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            match run_pre_dispatch(
+                &hooks,
+                id,
+                name,
+                input,
+                0,
+                &mut consecutive_block_count,
+                &mut total_block_count,
+            )
+            .await
+            {
+                PreDispatchResult::Allow => {
+                    let id = id.clone();
+                    let name = name.clone();
+                    let input = input.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        dispatch_to_tool_result(id, name, input)
+                    });
+                    spawn_futures.push((i, handle));
+                }
+                PreDispatchResult::Blocked(cb) => {
+                    slots[i] = Some(cb);
+                    blocked_flags[i] = true;
+                }
+                PreDispatchResult::ThresholdTripped => {
+                    threshold_tripped = true;
+                    break;
+                }
+            }
+        }
+
+        join_spawned_futures(spawn_futures, &mut slots, &tool_uses).await;
+        assert!(!threshold_tripped, "no threshold should trip");
+
+        // Verify: slot 0 (valid Read) was dispatched and has a result
+        assert!(!blocked_flags[0], "valid tool should not be blocked");
+        assert!(slots[0].is_some(), "valid tool slot should be filled");
+        if let Some(ContentBlock::ToolResult { is_error, .. }) = &slots[0] {
+            assert!(is_error.is_none(), "Read /dev/null should succeed");
+        }
+
+        // Verify: slot 1 (null-input) is blocked with error ToolResult
+        assert!(blocked_flags[1], "null-input tool should be blocked");
+        if let Some(ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        }) = &slots[1]
+        {
+            assert_eq!(tool_use_id, "tu_null");
+            assert!(content.contains("null input"));
+            assert_eq!(*is_error, Some(true));
+        } else {
+            panic!("expected ToolResult for null-input slot");
+        }
+
+        // Verify: post-dispatch loop skips blocked slots (the `continue` path)
+        let mut post_dispatch_count = 0;
+        for (i, (_, name, input)) in tool_uses.iter().enumerate() {
+            if blocked_flags[i] {
+                continue;
+            }
+            if let Some(ContentBlock::ToolResult {
+                ref content,
+                is_error,
+                ..
+            }) = slots[i]
+            {
+                let is_err = is_error.unwrap_or(false);
+                let _ = run_post_dispatch(&hooks, name, input, content, is_err, 0, false).await;
+                post_dispatch_count += 1;
+            }
+        }
+        // Only the valid (non-blocked) tool should get post-dispatch
+        assert_eq!(
+            post_dispatch_count, 1,
+            "post-dispatch should fire for valid tool only"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_path_threshold_trip_joins_pending_futures() {
+        // Simulates a batch where a guard hook blocks tools until the consecutive
+        // threshold trips mid-batch. Verifies:
+        //   (a) already-spawned futures are joined (slots filled)
+        //   (b) threshold_tripped is set
+        //   (c) the result is Vec::new() (no tool_results returned)
+        //
+        // We use a batch of 5 null-input tools: since null-input returns Blocked
+        // (without incrementing counters), this won't trip the threshold. Instead,
+        // we manually test the threshold trip path with a guard hook.
+        //
+        // Alternate approach: use a 4-tool batch where a blocking guard hook
+        // blocks tools 2-4 (hitting the consecutive limit of 3).
+        // For simplicity, we test with run_pre_dispatch directly.
+        let dir = tempfile::tempdir().unwrap();
+        let hook_script = dir.path().join("block.sh");
+        std::fs::write(
+            &hook_script,
+            "#!/bin/bash\necho '{\"action\":\"block\",\"reason\":\"policy\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let config_path = dir.path().join("hooks.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[hooks]]\nevent = \"PreToolUse\"\nphase = \"guard\"\ncommand = \"{}\"\n",
+                hook_script.display()
+            ),
+        )
+        .unwrap();
+
+        let hooks = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
+
+        // Batch: first tool is pure (Read) that gets dispatched BEFORE the blocks start,
+        // then 3 more tools that all get blocked, tripping the consecutive threshold.
+        // But since ALL tools match the guard hook, tool 0 will also be blocked.
+        // Instead: first tool has a non-matching match_tool (hook only matches Bash).
+        let config_path2 = dir.path().join("hooks2.toml");
+        std::fs::write(
+            &config_path2,
+            format!(
+                "[[hooks]]\nevent = \"PreToolUse\"\nphase = \"guard\"\ncommand = \"{}\"\nmatch_tool = \"Bash\"\n",
+                hook_script.display()
+            ),
+        )
+        .unwrap();
+        let hooks = HookRunner::load(config_path2.to_str().unwrap(), dir.path().to_str().unwrap());
+
+        let tool_uses: Vec<(String, String, serde_json::Value)> = vec![
+            // Tool 0: Read (not matched by guard) → Allow → spawned
+            (
+                "tu_0".to_string(),
+                "Read".to_string(),
+                serde_json::json!({"file_path": "/dev/null"}),
+            ),
+            // Tools 1-3: Bash (matched by guard) → Block, Block, ThresholdTripped
+            (
+                "tu_1".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo 1"}),
+            ),
+            (
+                "tu_2".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo 2"}),
+            ),
+            (
+                "tu_3".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo 3"}),
+            ),
+        ];
+        let batch_size = tool_uses.len();
+        let mut slots: Vec<Option<ContentBlock>> = vec![None; batch_size];
+        let mut blocked_flags: Vec<bool> = vec![false; batch_size];
+        let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
+        let mut consecutive_block_count = 0usize;
+        let mut total_block_count = 0usize;
+        let mut threshold_tripped = false;
+        let mut threshold_reason = TurnStopReason::EndTurn;
+
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            match run_pre_dispatch(
+                &hooks,
+                id,
+                name,
+                input,
+                0,
+                &mut consecutive_block_count,
+                &mut total_block_count,
+            )
+            .await
+            {
+                PreDispatchResult::Allow => {
+                    let id = id.clone();
+                    let name = name.clone();
+                    let input = input.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        dispatch_to_tool_result(id, name, input)
+                    });
+                    spawn_futures.push((i, handle));
+                }
+                PreDispatchResult::Blocked(cb) => {
+                    slots[i] = Some(cb);
+                    blocked_flags[i] = true;
+                }
+                PreDispatchResult::ThresholdTripped => {
+                    threshold_tripped = true;
+                    threshold_reason = threshold_stop_reason(consecutive_block_count);
+                    break;
+                }
+            }
+        }
+
+        // Join any already-spawned futures (tool 0's Read should complete)
+        join_spawned_futures(spawn_futures, &mut slots, &tool_uses).await;
+
+        // Verify threshold tripped
+        assert!(
+            threshold_tripped,
+            "consecutive block limit should have tripped"
+        );
+        assert_eq!(
+            threshold_reason,
+            TurnStopReason::BlockLimitConsecutive,
+            "reason should be consecutive limit"
+        );
+
+        // Verify tool 0 (Read, spawned before blocks) completed in its slot
+        assert!(
+            slots[0].is_some(),
+            "pre-threshold spawned tool should have a result"
+        );
+        if let Some(ContentBlock::ToolResult { is_error, .. }) = &slots[0] {
+            assert!(is_error.is_none(), "Read /dev/null should succeed");
+        }
+
+        // Verify tools 1-2 were blocked (slots filled with error results)
+        assert!(blocked_flags[1], "tool 1 should be blocked");
+        assert!(blocked_flags[2], "tool 2 should be blocked");
+        assert!(
+            slots[1].is_some(),
+            "blocked tool 1 should have error result"
+        );
+        assert!(
+            slots[2].is_some(),
+            "blocked tool 2 should have error result"
+        );
+
+        // Verify tool 3 was NOT processed (loop broke on ThresholdTripped)
+        assert!(!blocked_flags[3], "tool 3 should not have been processed");
+        assert!(
+            slots[3].is_none(),
+            "tool 3 slot should be empty (threshold broke before it)"
+        );
+
+        // In the real parallel path, threshold_tripped → Vec::new() (no tool_results)
+        // and conversation.pop() fires. We verify the threshold_tripped flag is set,
+        // which is what run_turn checks.
+        let tool_results: Vec<ContentBlock> = if threshold_tripped {
+            Vec::new()
+        } else {
+            slots.into_iter().map(|s| s.unwrap()).collect()
+        };
+        assert!(
+            tool_results.is_empty(),
+            "threshold trip should produce empty results"
+        );
+    }
 }

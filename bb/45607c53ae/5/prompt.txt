@@ -1,0 +1,88 @@
+push
+
+---
+
+only global hooks i see are markdown formatter and python
+
+---
+
+whats sandbox status
+
+---
+
+copy, so i just need a plan then work right?
+
+---
+
+wait, we can try something here. I have the forge-loop-supervisor skill but that uses tmux. But I have this new cmux terminal and that has it's own skills suite. lets investigate how we can do this with cmux
+
+---
+
+oh yeah this is clean! how you thinking to build it out? as a skill or something else?
+
+---
+
+standalone in this project first to prove it out
+
+---
+
+lets spin it
+
+---
+
+check the window, it looks like it restarted
+
+---
+
+i'll keep an eye on it, i have lazygit running in a seperate window as well so i can see any file changes
+
+---
+
+<task-notification>
+<task-id>bz3s0e6s6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/4d13f5a3-e231-42f8-b724-529a1316c6a0/tasks/bz3s0e6s6.output</output-file>
+<status>completed</status>
+<summary>Background command "Run supervisor with plan mode, 1 iteration" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/4d13f5a3-e231-42f8-b724-529a1316c6a0/tasks/bz3s0e6s6.output
+
+---
+
+Clean. Guess we test build next
+
+---
+
+<task-notification>
+<task-id>b663wfdfv</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/4d13f5a3-e231-42f8-b724-529a1316c6a0/tasks/b663wfdfv.output</output-file>
+<status>failed</status>
+<summary>Background command "Run supervisor in build mode (default)" failed with exit code 1</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/4d13f5a3-e231-42f8-b724-529a1316c6a0/tasks/b663wfdfv.output
+
+---
+
+something happened: Done. Phase 2 item 4 shipped as v0.0.11.
+
+**What was implemented:** `load_project_instructions()` in `src/main.rs` — reads `CLAUDE.md` (priority) or `AGENTS.md` from cwd, appends to system prompt with a `## Project Instructions (from {filename})` header. 32KB size guard, permission error handling, symlink support, verbose/warn logging. 11 new tests, 151 total passing.
+
+Phase 2 is now 4/5 complete. Only item 5 (Run Turn Refactor) remains.
+
+
+════════════════════ LOOP 4 ════════════════════
+
+^C
+
+Caught signal, stopping...
+basher8383@BrentsMacStudio forgeflare-hooks % ./loop.sh
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Ralph Wiggum Loop
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Mode:   build
+Prompt: PROMPT_build.md
+Output: human
+Branch: main
+Stop:   Ctrl+C
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

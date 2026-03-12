@@ -2485,4 +2485,86 @@ mod tests {
             "signal_break without threshold should produce ConvergenceSignal"
         );
     }
+
+    #[test]
+    fn trim_conversation_preserves_first_message_content() {
+        // The first message (system context) must survive trimming with its
+        // content intact — trim removes from position 1 onwards, not position 0.
+        let first_text = "I am the first message and must survive".to_string();
+        let mut msgs = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: first_text.clone(),
+            }],
+        }];
+        // Stuff enough messages to exceed CONTEXT_BUDGET_BYTES
+        let filler = "x".repeat(100_000);
+        for i in 0..20 {
+            msgs.push(Message {
+                role: if i % 2 == 0 { "assistant" } else { "user" }.to_string(),
+                content: vec![ContentBlock::Text {
+                    text: filler.clone(),
+                }],
+            });
+        }
+        let original_len = msgs.len();
+        trim_conversation(&mut msgs);
+        assert!(msgs.len() < original_len, "should have trimmed something");
+        // The critical assertion: first message content is byte-identical.
+        if let ContentBlock::Text { text } = &msgs[0].content[0] {
+            assert_eq!(text, &first_text, "first message content must be preserved");
+        } else {
+            panic!("expected Text block in first message");
+        }
+    }
+
+    #[test]
+    fn recover_conversation_two_messages_trailing_user() {
+        // Boundary: exactly 2 messages [user, user]. The trailing user should
+        // be popped, leaving 1 message.
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "first".to_string(),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "second".to_string(),
+                }],
+            },
+        ];
+        recover_conversation(&mut msgs);
+        assert_eq!(msgs.len(), 1, "trailing user should be popped");
+        assert_eq!(msgs[0].role, "user");
+        if let ContentBlock::Text { text } = &msgs[0].content[0] {
+            assert_eq!(text, "first");
+        } else {
+            panic!("expected Text block");
+        }
+    }
+
+    #[test]
+    fn recover_conversation_two_messages_trailing_assistant() {
+        // Boundary: exactly 2 messages [user, assistant(text)]. Nothing should
+        // be popped because trailing is not user and assistant has text (not orphaned).
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "hi there".to_string(),
+                }],
+            },
+        ];
+        recover_conversation(&mut msgs);
+        assert_eq!(msgs.len(), 2, "nothing should be popped");
+    }
 }

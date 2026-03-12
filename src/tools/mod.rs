@@ -1095,4 +1095,82 @@ mod tests {
         assert!(r1.is_ok(), "first grep should succeed");
         assert!(r2.is_ok(), "second grep should succeed");
     }
+
+    #[test]
+    fn edit_replace_all_zero_matches_returns_error() {
+        // replace_all=true with a string that doesn't exist in the file
+        // should return Err, not silently succeed with 0 replacements.
+        let dir = std::env::temp_dir().join("forgeflare_test_edit");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("test_replace_all_zero.txt");
+        std::fs::write(&file, "hello world").unwrap();
+
+        let result = dispatch_tool(
+            "Edit",
+            &json!({
+                "file_path": file.to_str().unwrap(),
+                "old_str": "zzz_nonexistent_zzz",
+                "new_str": "replacement",
+                "replace_all": true,
+            }),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "replace_all with 0 matches should error");
+        assert!(result.unwrap_err().contains("not found"));
+
+        // File should be unchanged
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "hello world");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn glob_path_trailing_slash_works() {
+        // path="src/" with trailing slash should work identically to path="src"
+        let result = dispatch_tool(
+            "Glob",
+            &json!({"pattern": "*.rs", "path": "src/"}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(
+            output.contains(".rs"),
+            "should find .rs files with trailing slash path"
+        );
+    }
+
+    #[test]
+    fn read_exactly_1mb_succeeds() {
+        // The guard is `> 1_048_576` (strict greater-than), so exactly 1MB
+        // should be allowed. 1MB + 1 should be rejected.
+        let dir = std::env::temp_dir().join("forgeflare_test_read_boundary");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let file_ok = dir.join("exactly_1mb.txt");
+        let data_ok = "a".repeat(1_048_576);
+        std::fs::write(&file_ok, &data_ok).unwrap();
+
+        let result = dispatch_tool(
+            "Read",
+            &json!({"file_path": file_ok.to_str().unwrap()}),
+            &mut |_| {},
+        );
+        assert!(result.is_ok(), "exactly 1MB should be allowed");
+        assert_eq!(result.unwrap().len(), 1_048_576);
+
+        let file_over = dir.join("over_1mb.txt");
+        let data_over = "a".repeat(1_048_577);
+        std::fs::write(&file_over, &data_over).unwrap();
+
+        let result = dispatch_tool(
+            "Read",
+            &json!({"file_path": file_over.to_str().unwrap()}),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "1MB + 1 should be rejected");
+        assert!(result.unwrap_err().contains("too large"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -819,4 +819,38 @@ mod tests {
             panic!("expected ToolUse block");
         }
     }
+
+    #[tokio::test]
+    async fn parse_sse_empty_data_line_skipped() {
+        // A bare "data: " line (empty payload) should be silently skipped
+        // because serde_json::from_str("") fails → continue. The parser
+        // should still produce valid output from subsequent well-formed events.
+        let sse_data = concat!(
+            "event: empty_payload\n",
+            "data: \n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"survived\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let (blocks, stop, _usage) = parse_sse_stream(stream, &mut |_| {}).await.unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(blocks.len(), 1);
+        if let ContentBlock::Text { text } = &blocks[0] {
+            assert_eq!(
+                text, "survived",
+                "parser should recover after empty data line"
+            );
+        } else {
+            panic!("expected Text block");
+        }
+    }
 }

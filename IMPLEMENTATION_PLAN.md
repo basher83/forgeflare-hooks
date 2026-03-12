@@ -1,6 +1,6 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 8/8 fixed. 172 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 15/15 fixed. 179 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
@@ -11,6 +11,8 @@ Updated 2026-03-12: Second audit pass found two test coverage gaps in parallel d
 Updated 2026-03-12: Third audit pass (v0.0.21). Four issues found and fixed: (1) Cargo.toml version was `0.1.0` while git tags were `v0.0.x` — session transcripts via `env!("CARGO_PKG_VERSION")` were lying. Fixed to `0.0.21`. (2) Missing test for Stop hook returning unrecognized action value (hooks.md R3). Added `stop_unrecognized_action_does_not_panic`. (3) Missing test for `threshold_tripped` precedence over `signal_break` (hooks.md R6). Added `threshold_takes_precedence_over_signal_break`. (4) glob-shell-injection.md R2 incorrectly stated glob crate returns "filesystem order (platform-dependent)" — corrected to "alphabetical order" per implementation notes.
 
 Updated 2026-03-12: Fourth audit pass (v0.0.22). Full spec-vs-implementation test coverage audit. Four new tests added: (1) SSE error with absent `error.type` field defaults to transient (api-retry R1). (2) Brace expansion producing invalid pattern fails the entire glob operation (glob-shell-injection R5). (3) Convergence write failure returns Err without panic (hooks R8, unix-only). (4) Guard-hook blocked tools skip PostToolUse via blocked_flags (hooks R7).
+
+Updated 2026-03-12: Fifth audit pass (v0.0.23). Boundary and edge-case coverage audit. Seven new tests added: (1) `trim_conversation_preserves_first_message_content` — asserts first message content is byte-identical after trim (not just length check). (2) `recover_conversation_two_messages_trailing_user` — boundary: exactly 2 messages with trailing user gets popped to 1. (3) `recover_conversation_two_messages_trailing_assistant` — boundary: exactly 2 messages with trailing assistant stays at 2. (4) `edit_replace_all_zero_matches_returns_error` — `replace_all=true` with 0 matches returns Err, file unchanged. (5) `glob_path_trailing_slash_works` — `path="src/"` with trailing slash works (double-slash tolerant). (6) `read_exactly_1mb_succeeds` — boundary: exactly 1MB allowed, 1MB+1 rejected (strict greater-than guard). (7) `parse_sse_empty_data_line_skipped` — empty `data: ` payload silently skipped, subsequent events parsed correctly.
 
 ## Spec Audit Results (2026-03-12)
 

@@ -2183,32 +2183,18 @@ mod tests {
             std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
+        // Guard hook only matches Bash — Read tools pass through unblocked,
+        // so we can test that the threshold trip joins already-spawned Read futures.
         let config_path = dir.path().join("hooks.toml");
         std::fs::write(
             &config_path,
-            format!(
-                "[[hooks]]\nevent = \"PreToolUse\"\nphase = \"guard\"\ncommand = \"{}\"\n",
-                hook_script.display()
-            ),
-        )
-        .unwrap();
-
-        let hooks = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
-
-        // Batch: first tool is pure (Read) that gets dispatched BEFORE the blocks start,
-        // then 3 more tools that all get blocked, tripping the consecutive threshold.
-        // But since ALL tools match the guard hook, tool 0 will also be blocked.
-        // Instead: first tool has a non-matching match_tool (hook only matches Bash).
-        let config_path2 = dir.path().join("hooks2.toml");
-        std::fs::write(
-            &config_path2,
             format!(
                 "[[hooks]]\nevent = \"PreToolUse\"\nphase = \"guard\"\ncommand = \"{}\"\nmatch_tool = \"Bash\"\n",
                 hook_script.display()
             ),
         )
         .unwrap();
-        let hooks = HookRunner::load(config_path2.to_str().unwrap(), dir.path().to_str().unwrap());
+        let hooks = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
 
         let tool_uses: Vec<(String, String, serde_json::Value)> = vec![
             // Tool 0: Read (not matched by guard) → Allow → spawned

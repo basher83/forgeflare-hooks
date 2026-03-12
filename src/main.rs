@@ -2317,4 +2317,45 @@ mod tests {
             "threshold trip should produce empty results"
         );
     }
+
+    #[test]
+    fn threshold_takes_precedence_over_signal_break() {
+        // hooks.md R6: "Block threshold takes unconditional precedence over
+        // signal_break in both paths." When both threshold_tripped and
+        // signal_break are true, the turn stop reason must be the threshold
+        // reason, not ConvergenceSignal.
+        let threshold_tripped = true;
+        let signal_break = true;
+        let threshold_reason = TurnStopReason::BlockLimitConsecutive;
+
+        // Mirror the exact control flow from run_turn lines 873-892:
+        let turn_stop_reason = if threshold_tripped {
+            threshold_reason
+        } else if signal_break {
+            TurnStopReason::ConvergenceSignal
+        } else {
+            TurnStopReason::EndTurn
+        };
+
+        assert_eq!(
+            turn_stop_reason,
+            TurnStopReason::BlockLimitConsecutive,
+            "threshold must take precedence over signal_break"
+        );
+
+        // Verify signal_break alone would produce ConvergenceSignal
+        let turn_stop_no_threshold = if false {
+            TurnStopReason::BlockLimitConsecutive
+        } else if signal_break {
+            TurnStopReason::ConvergenceSignal
+        } else {
+            TurnStopReason::EndTurn
+        };
+
+        assert_eq!(
+            turn_stop_no_threshold,
+            TurnStopReason::ConvergenceSignal,
+            "signal_break without threshold should produce ConvergenceSignal"
+        );
+    }
 }

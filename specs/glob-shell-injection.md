@@ -42,7 +42,7 @@ The fix is to use Rust's `glob` crate, which does pattern matching in-process wi
 - Result format: newline-separated file paths, same as current output
 - Result limit: cap at 1000 entries (current `head -1000` behavior)
 - Empty results: return `"No files found"` string (current behavior)
-- Sorting: current behavior sorts by shell expansion order. The `glob` crate returns results in filesystem order (platform-dependent). This is acceptable — the tool description says "sorted by modification time" but the implementation never sorted by mtime. Do not add mtime sorting; accept glob crate ordering.
+- Sorting: current behavior sorts by shell expansion order. The `glob` crate returns results in alphabetical order. This is acceptable — the tool description says "sorted by modification time" but the implementation never sorted by mtime. Do not add mtime sorting; accept glob crate ordering.
 
 **R3. Pattern Construction**
 - If the pattern starts with `/` or `.`, use it as-is (absolute or explicit relative)

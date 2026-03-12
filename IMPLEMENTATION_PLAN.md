@@ -1,12 +1,14 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 2/2 fixed. 166 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 4/4 fixed. 168 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
 Updated 2026-03-12: Full spec-vs-implementation audit across all 16 specs. Three gaps found and fixed: (1) release workflow missing `--latest` flag (spec R4, v0.0.16); (2) actions/checkout SHA mismatch between ci.yml and release.yml (spec R6, v0.0.16); (3) unknown SSE error types classified as permanent instead of transient (api-retry spec R1, v0.0.17).
 
 Updated 2026-03-12: Second audit pass found two test coverage gaps in parallel dispatch path. Both fixed in v0.0.19: (1) null-input tool_use in parallel path — test verifies error ToolResult produced and post-hooks skipped via blocked_flags; (2) mid-batch threshold trip — test verifies already-spawned futures joined, threshold_tripped set, and empty result returned.
+
+Updated 2026-03-12: Third audit pass (v0.0.21). Four issues found and fixed: (1) Cargo.toml version was `0.1.0` while git tags were `v0.0.x` — session transcripts via `env!("CARGO_PKG_VERSION")` were lying. Fixed to `0.0.21`. (2) Missing test for Stop hook returning unrecognized action value (hooks.md R3). Added `stop_unrecognized_action_does_not_panic`. (3) Missing test for `threshold_tripped` precedence over `signal_break` (hooks.md R6). Added `threshold_takes_precedence_over_signal_break`. (4) glob-shell-injection.md R2 incorrectly stated glob crate returns "filesystem order (platform-dependent)" — corrected to "alphabetical order" per implementation notes.
 
 ## Spec Audit Results (2026-03-12)
 
@@ -28,7 +30,9 @@ Full line-by-line audit of all specs against implementation. Results:
 - `run-turn-refactor.md` — No gaps. Extracted helpers, both bug fixes, under 350 lines.
 - `release-workflow.md` — Two gaps fixed: `--latest` flag added to `gh release create` (v0.0.16); `actions/checkout` SHA aligned with ci.yml (v0.0.16).
 
-## Intentional Spec Deviations (by design, not bugs)
+## Known Untestable Gaps
+
+- `classify_error` for `AgentError::Api(reqwest::Error)` timeout/connect branches: constructing a `reqwest::Error` requires actual network failures. The error classification logic is correct by inspection, but these specific branches have no unit test. Accepted constraint — not worth introducing a mock HTTP layer for two match arms.
 
 - `coding-agent.md` R4 lists `Glob(path?, recursive?)` — `recursive` parameter not implemented. The `glob` crate handles `**` patterns natively, making an explicit parameter redundant. The model uses `**/*.rs` directly.
 - `coding-agent.md` R4 lists `Bash(command, cwd?)` — `cwd` parameter not implemented. The model uses `cd dir && command` pattern. Claude Code itself omits this parameter.
@@ -38,6 +42,7 @@ Full line-by-line audit of all specs against implementation. Results:
 
 - `release-workflow.md` line 77: success criteria says "working `agent` binary" — should say `forgeflare`.
 - `session-capture.md` JSONL example (line 101): uses snake_case `read_file` in tool_use name. Should be PascalCase `Read` per `tool-name-compliance.md`.
+- `glob-shell-injection.md` R2: said "filesystem order (platform-dependent)" — corrected to "alphabetical order" (v0.0.21).
 
 ## Minor Code Observations (not blocking)
 

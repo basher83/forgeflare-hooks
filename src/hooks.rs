@@ -1152,6 +1152,51 @@ timeout_ms = 5000
     }
 
     #[tokio::test]
+    async fn stop_unrecognized_action_does_not_panic() {
+        // hooks.md R3: "Unrecognized action values in Stop output are logged
+        // and treated as continue." This verifies a Stop hook returning an
+        // unknown action (e.g., "signal") is absorbed without panic, and the
+        // convergence final state is still written correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let hook_script = dir.path().join("weird_stop.sh");
+        fs::write(
+            &hook_script,
+            "#!/bin/bash\necho '{\"action\":\"signal\"}'\n",
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let config_path = dir.path().join("hooks.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[[hooks]]\nevent = \"Stop\"\ncommand = \"{}\"\n",
+                hook_script.display()
+            ),
+        )
+        .unwrap();
+
+        let runner = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
+        // Should not panic — unrecognized action is logged and ignored
+        runner.run_stop("end_turn", 5, 20000).await;
+
+        // Convergence final state should still be written despite unrecognized action
+        let conv_path = dir.path().join(".forgeflare/convergence.json");
+        let conv = fs::read_to_string(&conv_path).unwrap();
+        let state: ConvergenceState = serde_json::from_str(&conv).unwrap();
+        assert!(state.final_state.is_some());
+        let final_s = state.final_state.unwrap();
+        assert_eq!(final_s.reason, "end_turn");
+        assert_eq!(final_s.tool_iterations, 5);
+        assert_eq!(final_s.total_tokens, 20000);
+    }
+
+    #[tokio::test]
     async fn no_matching_hooks_returns_allow() {
         let dir = tempfile::tempdir().unwrap();
         let hook_script = dir.path().join("guard.sh");

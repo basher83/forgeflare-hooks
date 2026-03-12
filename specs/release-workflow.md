@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # GitHub Release Workflow Specification
 
-**Status:** Active
 **Target:** Cross-platform release binaries via GitHub Actions, triggered by version tags
 
 ---

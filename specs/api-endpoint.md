@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # API Endpoint Configuration Specification
 
-**Status:** Active
 **Target:** Route API requests through a configurable endpoint, defaulting to the tailnet OAuth proxy
 
 ---

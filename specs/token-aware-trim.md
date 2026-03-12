@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # Token-Aware Context Trimming
 
-**Status:** Active
 **Target:** Use actual API token counts to inform context trim aggressiveness instead of relying solely on byte-size heuristics
 
 ---

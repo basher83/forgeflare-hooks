@@ -1,0 +1,295 @@
+<task-notification>
+<task-id>a51b77aa58f9069e3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/8aac52da-2edf-4887-bae8-ee91f66f8d8c/tasks/a51b77aa58f9069e3.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit session/trim/maxtoken specs" completed</summary>
+<result>I now have all the information needed for a complete analysis. Here is the full, line-by-line gap report.
+
+---
+
+# Requirement Verification Report
+
+## session-capture.md
+
+### R1. JSONL Transcript
+
+All sub-requirements are met. `session.rs` defines `JsonlLine` with every required field: `type`, `sessionId`, `uuid`, `parentUuid`, `timestamp`, `cwd`, `version`, `message.role`, `message.content`. The `parentUuid` is `None` on the first line and the UUID of the previous line on all subsequent lines. User turns use `type: "user"` and `role: "user"`; assistant turns use `type: "assistant"` and `role: "assistant"`. Content is the existing `Vec<ContentBlock>`, which carries text, tool_use, and tool_result blocks as required.
+
+**No gaps.**
+
+### R2. Token Usage
+
+`api.rs`'s `parse_sse_stream` extracts all four fields — `input_tokens` and `cache_creation_input_tokens`/`cache_read_input_tokens` from `message_start`, and `output_tokens` from `message_delta` — and returns them as the third element of the `(Vec<ContentBlock>, StopReason, Usage)` tuple. `session.rs`'s `append_assistant_turn` attaches `usage` to assistant JSONL lines via `MessagePayload.usage`. User turns skip the field via `#[serde(skip_serializing_if = "Option::is_none")]`. `send_message` already returns `Usage` as the third tuple element.
+
+**No gaps.**
+
+### R3. Session Identity
+
+`SessionWriter::new` generates `format!("{}-{}", date, Uuid::new_v4())` where `date` is `Utc::now().format("%Y-%m-%d")`. This matches the `{date}-{uuid}` format with UUID v4.
+
+**No gaps.**
+
+### R4. Timestamps
+
+Every JSONL line records `Utc::now().to_rfc3339()` at the time `append_line` is called, which is called from `append_user_turn` and `append_assistant_turn` immediately after each turn. That satisfies "captures when the turn was added to the conversation."
+
+**No gaps.**
+
+### R5. Supporting Files
+
+`prompt.txt` is implemented and idempotent (writes only once via `prompt_written` flag). `context.md` is implemented and contains session ID, model, start time, CWD, and a "Key Actions" section listing `**{tool_name}**: {first_arg}` per tool_use block. `summary.txt` is not written, which matches the spec ("left empty or absent").
+
+**No gaps.**
+
+### R6. Write Timing
+
+`full.jsonl` uses `OpenOptions::new().create(true).append(true).open(path)` per turn — no buffering, crash-safe. `write_prompt` is called immediately at the top of `run_turn`, before the API call. `write_context` is called at session end in `main` (line 519), after the outer loop exits.
+
+**No gaps.**
+
+### R7. Directory Structure
+
+`ensure_dir` calls `fs::create_dir_all(&self.dir)`, which creates all intermediate directories (`.entire/`, `.entire/metadata/`, and the session subdirectory) as needed. Existing files are not touched since only the session's own files are written.
+
+**No gaps.**
+
+---
+
+## token-aware-trim.md
+
+### R1. Track Last Known Input Tokens
+
+`last_input_tokens: u64` is declared at the top of `run_turn` (line 545) alongside `tool_iterations`, initialised to 0. After each successful `send_message`, `last_input_tokens = usage.input_tokens` is set (line 625). Because `last_input_tokens` is declared inside `run_turn`, it resets to 0 on every outer loop iteration (each new user input), satisfying the "initialize to 0 at the start of each outer loop iteration" requirement.
+
+**No gaps.**
+
+### R2. Token-Based Trim Decision
+
+`trim_if_needed` implements the exact three-branch gate:
+
+```rust
+fn trim_if_needed(messages: &mut Vec<Message>, last_input_tokens: u64) {
+    if last_input_tokens == 0 || last_input_tokens >= TRIM_THRESHOLD {
+        trim_conversation(messages);
+    }
+}
+```
+
+`last_input_tokens == 0` falls through to byte trim. `> 0 && < TRIM_THRESHOLD` skips trim. `>= TRIM_THRESHOLD` runs byte trim. This matches all three spec branches exactly.
+
+**No gaps.**
+
+### R3. Context Window Constant
+
+Both constants are present at the module level:
+
+```rust
+const MODEL_CONTEXT_TOKENS: u64 = 200_000;
+const TRIM_THRESHOLD: u64 = MODEL_CONTEXT_TOKENS * 60 / 100; // 120K tokens
+```
+
+**No gaps.**
+
+### R4. Preserve Byte-Based Safety Net
+
+`trim_conversation` itself is unchanged. `trim_if_needed` only gates whether to call it. When token data is absent (`last_input_tokens == 0`), byte trim runs unconditionally.
+
+**No gaps.**
+
+---
+
+## maxtoken-continuation.md
+
+### R1. Detect Continuable Truncation
+
+`classify_max_tokens` is called after `filter_null_input_tool_use` has already run (the filtering happens at line 636-640, before the assistant message is committed at 642-647, before `classify_max_tokens` is called at 660). The function checks: if only the placeholder text remains (`BreakEmpty`), if valid tool_use blocks are present (`DispatchTools`), and otherwise whether to continue or break at cap. This matches the spec's three-way branch.
+
+**No gaps.**
+
+### R2. Inject Continuation Prompt
+
+The continuation message is `"Continue from where you left off."` (exact spec text). It is pushed to `conversation`, logged via `session.append_user_turn(&cont_msg)`, and `continue` is used to loop back to the API call. `tool_iterations` is not incremented on continuation.
+
+**No gaps.**
+
+### R3. Cap Continuations
+
+`MAX_CONTINUATIONS: usize = 3` (line 882). The `continuation_count` is incremented before checking the cap (`continuation_count < MAX_CONTINUATIONS` in `classify_max_tokens`), so the cap fires at exactly 3 attempts (counts 0, 1, 2 are allowed; at count 3 the `BreakCapReached` arm fires). This is correct.
+
+**No gaps.**
+
+### R4. Logging
+
+The log lines match the spec exactly:
+
+- `"[continue] Response truncated at max_tokens, requesting continuation ({}/{})"` with `continuation_count, MAX_CONTINUATIONS` — this prints e.g. `(1/3)`, `(2/3)`, `(3/3)`.
+- `"[continue] Max continuations reached, breaking"`.
+
+**One minor deviation to note:** The spec says `({n}/3)` implying the count before incrementing, but the code increments `continuation_count` before logging, so the log shows the new count (1 on first continuation, 2 on second, 3 on third). This matches the natural reading of the spec ("requesting continuation (1/3)" on first attempt) and is correct behaviour.
+
+**No gaps.**
+
+### Additional maxtoken-continuation success criteria checks
+
+- Empty MaxTokens response breaks without continuation: `BreakEmpty` path fires before any `continuation_count` check. Confirmed.
+- `continuation_count` resets on new user input: it is declared inside `run_turn`, so it resets per outer loop call. Confirmed.
+- Continuation prompt logged to JSONL via `session.append_user_turn()`: line 680 confirms this. Confirmed.
+- `continuation_count` does not increment when MaxTokens with valid tools dispatches: `DispatchTools` arm is a no-op (`{}`), no increment. Confirmed.
+- `continuation_count` does not reset on tool_result user messages within the inner loop: correct, it is only reset by `run_turn` re-entry. Confirmed.
+
+---
+
+## Summary
+
+**No gaps, missing features, or deviations were found in any of the three specs.** All 36 success criteria across the three specifications are implemented correctly in `src/main.rs` and `src/session.rs`. The `api.rs` usage parsing is complete and the `StopReason` type has `Serialize` derived (line 54-62 of `api.rs`). The architecture matches the canonical control flow prescribed in `maxtoken-continuation.md` exactly: EndTurn breaks, MaxTokens branches three ways, ToolUse falls through to dispatch.
+
+The only item worth flagging as a style note (not a correctness issue) is that the spec's R4 logging example uses `{n}/3` which could be read as the attempt number pre-increment, but the implementation increments first and logs the post-increment value, producing `1/3` through `3/3` — which is the natural human-readable form and matches the spec's intent.</result>
+<usage><total_tokens>77947</total_tokens><tool_uses>17</tool_uses><duration_ms>105457</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/8aac52da-2edf-4887-bae8-ee91f66f8d8c/tasks/a51b77aa58f9069e3.output
+
+---
+
+<task-notification>
+<task-id>a14fd855ea9c1eea4</task-id>
+<tool-use-id>toolu_0197A8wUC6N3HeNnhm6hcSth</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/8aac52da-2edf-4887-bae8-ee91f66f8d8c/tasks/a14fd855ea9c1eea4.output</output-file>
+<status>completed</status>
+<summary>Agent "Audit hooks spec" completed</summary>
+<result>I now have a complete picture. Here is my thorough, line-by-line gap analysis.
+
+---
+
+## Gap Analysis: hooks.md spec vs. implementation
+
+### Confirmed Conformant
+
+The following spec requirements are correctly implemented:
+
+- R1 (Three hook events): PreToolUse, PostToolUse, Stop are all present.
+- R2 (TOML config at `.forgeflare/hooks.toml`): loaded via `HookRunner::load(".forgeflare/hooks.toml", &cwd)` with `toml::from_str`. Missing file returns empty runner.
+- R2 (`match_tool` exact matching): `matches_tool` uses `mt == tool`, confirmed by test `matches_tool_exact` which also verifies `"BashScript"` does not match `"Bash"`.
+- R2 (`phase` defaults to `"guard"`): `h.phase.as_deref().unwrap_or("guard")` in guard filter.
+- R2 (`timeout_ms` defaults): `DEFAULT_TIMEOUT_MS = 5000`, `DEFAULT_STOP_TIMEOUT_MS = 3000`, applied via `hook.timeout_ms.unwrap_or(...)`.
+- R3 (JSON stdin/stdout, stderr inherited): `bash -c`, stdin piped, stdout piped, `stderr(Stdio::inherit())`.
+- R3 (`tool_iterations` semantics): incremented only after tool_results are sent (`tool_iterations += 1` after `conversation.push(tool_msg)`), not incremented on aborted batches.
+- R3 (`result` capped at 5120 bytes): `truncate_result` with `floor_char_boundary` for UTF-8 safety. Truncation marker format is correct.
+- R4 (guard phase fail-closed): timeout → Block, non-zero exit → Block, invalid JSON → Block.
+- R4 (observe phase fail-open): errors logged via `eprintln!`, no effect on outcome.
+- R4 (observe hooks always run, with guard context): observe loop runs unconditionally after guard loop; `blocked`, `blocked_by`, `block_reason` included.
+- R4 (observe hooks when `blocked: false`): `blocked_by` and `block_reason` are only set when `blocked` is true; correct per spec ("absent from JSON input").
+- R4 (guard error message formats): `"hook failed: {cmd} timed out after {ms}ms (tool blocked by default)"`, `"hook failed: {cmd} exited with code {code} (tool blocked by default)"`, `"hook failed: {cmd} returned invalid JSON (tool blocked by default)"` — all match spec exactly.
+- R4 (intentional block format): `"blocked by {blocked_by}: {block_reason}"` via the `if block_reason.starts_with("hook failed:")` branch in `run_pre_tool_use`.
+- R4 (guard short-circuits on block): `break` after setting blocked state in guard loop.
+- R5 (PostToolUse and Stop fail-open): errors logged, processing continues.
+- R6 (`consecutive_block_count` reset on allow): reset at `PreDispatchResult::Allow` time in `run_pre_dispatch`, which is guard-allow time — correct for both sequential and parallel paths.
+- R6 (`total_block_count` never resets within inner loop): only resets between user turns (variables are declared in `run_turn`, reset at outer loop iteration).
+- R6 (both counters reset on new user input): declared in `run_turn` before the loop, re-initialized on each `run_turn` call.
+- R6 (`conversation.pop()` not `recover_conversation()`): confirmed at line 848.
+- R6 (threshold precedence over `signal_break`): `threshold_tripped` checked before `signal_break`, with comment "Block threshold takes precedence over signal_break".
+- R7 (`signal_break` flag pattern): set during PostToolUse loop, checked after tool_results sent, breaks without `recover_conversation()`.
+- R7 (PostToolUse only for dispatched tools): `run_post_dispatch` only called in the Allow path; blocked slots skip it via `blocked_flags[i]` check.
+- R7 (multiple PostToolUse hooks, first signal wins): `first_signal.is_none()` guard, all matching hooks still run.
+- R7 (every signaling hook writes its own observation): all signals appended to `observations` vec before single write.
+- R7 (single read-modify-write after all hooks): `write_observations` called once after the hook loop.
+- R8 (observations array with `signal`, `reason`, `tool_iterations`): matches spec schema.
+- R8 (`final` key with `reason`, `tool_iterations`, `total_tokens`, `timestamp`): matches spec schema.
+- R8 (startup truncation of convergence.json): `hooks.clear_convergence_state()` called after `HookRunner::load`.
+- R8 (atomic write via same-directory temp file): writes to `.forgeflare/convergence.json.tmp`, then `fs::rename`.
+- R8 (`create_dir_all` before first write): called inside both `write_observations` and `write_final_state`.
+- R8 (convergence write failures logged as warnings, don't affect return value): `if let Err(e) = write_observations(...) { eprintln!(...) }`.
+- R8 (Stop writes `final` key unconditionally, not just when hooks exist): `write_final_state` called at the end of `run_stop` regardless of whether any Stop hooks matched.
+- R9 (parallel path: guard loop before spawning, threshold check per-tool before `spawn_blocking`): confirmed — threshold check happens before `spawn_futures.push`.
+- R9 (parallel path: `join_spawned_futures` called even when threshold tripped): line 750 calls `join_spawned_futures` unconditionally before `if threshold_tripped`, then discards results via `Vec::new()` — avoids detaching `JoinHandle` futures.
+- R9 (parallel path: PostToolUse loop skipped when threshold tripped): the `else` branch (PostToolUse loop) is only reached when `!threshold_tripped`.
+- R9 (parallel path: `blocked_flags: Vec<bool>` to skip blocked slots in PostToolUse loop): confirmed.
+- R9 (parallel path: pre-allocated slots, `unwrap()` panics on unfilled slot after normal batch): `.map(|s| s.unwrap())`.
+- R9 (`dispatch_tool` signature unchanged): called identically in sequential and parallel paths.
+- Stop reason string "convergence_signal": `stop_reason_str = "convergence_signal"` after signal_break.
+- Stop hook unrecognized action: logged with eprintln, treated as continue (no control-flow effect).
+- HookRunner interface: `load`, `clear_convergence_state`, `run_pre_tool_use`, `run_post_tool_use`, `run_stop` all present with correct signatures.
+
+---
+
+### Gaps and Deviations Found
+
+**Gap 1 — `threshold_reason_str` inspects the wrong counter when both thresholds trip simultaneously**
+
+The spec (R6) says: "If both trip simultaneously (e.g., 3 consecutive blocks that also push the total to 10), use `"block_limit_consecutive"` (it fired first)."
+
+The implementation checks consecutive first in `run_pre_dispatch` (lines 274-277 before 278-281), so `ThresholdTripped` is returned after the consecutive check trips. However, `threshold_reason_str` (lines 325-331) looks at `consecutive_block_count` at the moment `threshold_reason` is captured. The problem is that `threshold_reason` is captured *after the break from the guard loop*, so it reads the counter values at that point — which is correct. But there is a subtle structural issue: `threshold_reason_str` takes `consecutive_block_count` by value (not a flag indicating *which* counter tripped). If only the total counter trips (consecutive is, say, 2 out of 3) the function correctly returns `"block_limit_total"`. If consecutive trips first, consecutive is 3, function returns `"block_limit_consecutive"`. The logic is actually correct in the single-cause case.
+
+However, the "simultaneous" edge case described in the spec (consecutive hits 3 AND total also hits 10 on the same block): `run_pre_dispatch` checks consecutive first, returns `ThresholdTripped` before checking total. So at the call site, `consecutive_block_count` is 3 and `threshold_reason_str(3)` returns `"block_limit_consecutive"`. This is correct. No actual gap here — the implementation is fine for this edge case.
+
+**Gap 2 — Sequential path: partial `tool_results` from tools dispatched before the threshold tripped are silently discarded without explicitly discharging the conversation**
+
+The spec says (R9 sequential path pseudocode and the architecture diagram):
+
+```
+if threshold_tripped:
+  conversation.pop() + break (reason: block_limit_*)
+  (tool_results discarded — batch abandoned, no message sent)
+```
+
+The implementation does match this — when `threshold_tripped`, it does `conversation.pop(); break` and the partially-collected `tool_results` vector is dropped. The conversation is popped back to before the assistant message. This is correct.
+
+However, the sequential path `tool_results` vector may already contain results from tools that executed *before* the blocking tool hit the threshold. The spec says these are discarded ("batch abandoned, no message sent") and the implementation does discard them. This is correct. No gap.
+
+**Gap 3 (Real) — The `threshold_reason_str` function does NOT capture which counter tripped at `ThresholdTripped` return time; it re-reads `consecutive_block_count` at the call site after the `break`**
+
+Looking more carefully: `run_pre_dispatch` returns `ThresholdTripped` without encoding *which* counter tripped. The caller then calls `threshold_reason_str(consecutive_block_count)` — but by this point `consecutive_block_count` has already been incremented (inside `run_pre_dispatch`). Since `consecutive_block_count` is passed by `&mut usize` and mutated before returning `ThresholdTripped`, the count at the call site is the post-increment value. So if consecutive was 2 before the block, it becomes 3, and `threshold_reason_str(3)` correctly returns `"block_limit_consecutive"`. If total tripped first (consecutive was 1, total hit 10), `threshold_reason_str(1)` returns `"block_limit_total"`. This is correct per the logic. No actual gap.
+
+**Gap 4 (Real) — `Stop` hook `match_tool` filtering is not applied**
+
+`run_stop` filters hooks only by `h.event == "Stop"` — it does not apply `matches_tool`. The spec (R2) says `match_tool` is optional and when omitted fires for all tools. For Stop hooks there is no "current tool" concept, so `match_tool` on a Stop hook is meaningless. This is not a gap — the spec doesn't say Stop hooks should be filtered by tool. The implementation correctly collects all Stop-event hooks.
+
+**Gap 5 (Real) — `HookRunner::load` logs TOML parse errors but silently swallows missing-file errors**
+
+The spec says: "Missing file → empty runner (no-op)". The implementation returns `Vec::new()` on any `fs::read_to_string` error, not just `NotFound`. This means if the file exists but has a permissions error, it silently produces an empty runner instead of logging a warning. The spec doesn't explicitly say to log a warning on non-NotFound read errors (only `clear_convergence_state` has that specific requirement), but this is a minor silent-failure path worth noting. Not a definitive spec violation, since the spec only specifies the missing-file behavior.
+
+**Gap 6 (Real) — `run_stop` writes `final` to `convergence.json` even when `hooks` is empty (no hooks.toml)**
+
+The spec says: "If no `.forgeflare/hooks.toml` exists, `HookRunner` is a no-op. Zero overhead when unconfigured." It also says under R8: "Stop hook writes the `final` key. Write-once per session." And: "Convergence write failures logged as warnings."
+
+In `run_stop`, after the Stop hook loop (which does nothing if there are no hooks), `write_final_state` is called unconditionally. This means even when there is no `hooks.toml`, forgeflare still creates `.forgeflare/convergence.json` on every session. This contradicts the "zero overhead when unconfigured" principle and the no-op contract for the empty runner.
+
+The spec's R8 architecture note says "Stop hook writes the `final` key" — implying this happens as part of the Stop hook event. But because `write_final_state` runs even with no matching Stop hooks, the file is written regardless. This is a deviation: the convergence file should arguably not be created at all when no `hooks.toml` is configured.
+
+**Gap 7 (Real, minor) — `run_stop` does not filter Stop hooks by `match_tool` when `match_tool` is set**
+
+If someone configures a Stop hook with `match_tool = "Bash"`, the implementation will ignore the `match_tool` field and run it anyway. The spec does not explicitly forbid `match_tool` on Stop hooks, but the `run_stop` implementation doesn't apply `matches_tool`. This is a cosmetic spec ambiguity rather than a clear gap — the spec only shows `match_tool` in PreToolUse examples.
+
+**Gap 8 (Real) — Sequential path: the `threshold_tripped` check and `tool_results` discard happen *after* the for loop, but the sequential path returns `tool_results` from inside the if/else block, and the discarded partial results are never explicitly zeroed**
+
+Looking at lines 782-844: the sequential path collects results into a local `tool_results: Vec<ContentBlock>`. When `threshold_tripped = true` and we break, this vector may have some results from tools that ran before the blocking tool. The outer `if threshold_tripped` (line 847) then calls `conversation.pop(); break` without touching `tool_results`. The vector is dropped when the scope exits. This is correct per the spec ("tool_results discarded"). No actual gap — just confirming the discard path is correct.
+
+**Gap 9 (Real) — The `run_pre_dispatch` function passes the null-input block path WITHOUT running observe hooks**
+
+The spec (R4) says observe hooks "Always run, even after a guard blocks." And the spec's PreToolUse observe phase section says observe hooks run "after a guard block" with `blocked: true`.
+
+When `input.is_null()`, `run_pre_dispatch` returns `PreDispatchResult::Blocked(...)` immediately without calling `hooks.run_pre_tool_use`. The null-input check in `run_pre_dispatch` (lines 259-265) bypasses `run_pre_tool_use` entirely. This means:
+
+1. Guard hooks are not run (acceptable — no meaningful input to send).
+2. Observe hooks are not run (gap — observe hooks configured for audit logging will miss null-input events entirely).
+
+The spec says observe hooks "always run, even after a guard blocks." A null-input is a form of block. Observe hooks should receive the blocked=true signal for this case. The current implementation silently skips all observe hooks for null-input tool_uses.
+
+This is a real gap: `/Users/basher8383/3I/forge/forgeflare-hooks/src/main.rs` lines 259-265.
+
+---
+
+### Summary of Real Gaps
+
+There are three meaningful gaps:
+
+1. **Gap 6**: `run_stop` unconditionally writes to `convergence.json` even when no `hooks.toml` is configured, violating the "zero overhead / no-op when unconfigured" contract. Location: `/Users/basher8383/3I/forge/forgeflare-hooks/src/hooks.rs` lines 377-388 — the `write_final_state` call is outside any guard on `self.hooks.is_empty()`.
+
+2. **Gap 9**: Null-input tool_use events bypass `run_pre_tool_use` entirely, so observe-phase hooks configured for audit logging never see null-input blocks. Location: `/Users/basher8383/3I/forge/forgeflare-hooks/src/main.rs` lines 259-265 in `run_pre_dispatch`. The spec says observe hooks "always run, even after a guard blocks."
+
+3. **Gap 5** (minor): Non-`NotFound` errors from reading `hooks.toml` (e.g., permission denied) are silently swallowed — the error is not logged. Location: `/Users/basher8383/3I/forge/forgeflare-hooks/src/hooks.rs` line 93 (`Err(_) => Vec::new()`). Only TOML parse errors get logged. The spec is silent on this case, but it's a divergence from the explicit logging requirement for TOML parse failures.
+
+Everything else in the spec is correctly implemented, including all block counter semantics, error message formats, convergence file structure, atomic writes, parallel path slot management, observe hook context fields, PostToolUse signal accumulation, and Stop reason strings for all seven stop conditions.</result>
+<usage><total_tokens>78204</total_tokens><tool_uses>19</tool_uses><duration_ms>148734</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-basher8383-3I-forge-forgeflare-hooks/8aac52da-2edf-4887-bae8-ee91f66f8d8c/tasks/a14fd855ea9c1eea4.output

@@ -1,6 +1,6 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. 163 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. 163 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
@@ -111,6 +111,7 @@ These are NOT Phase 2 spec items but bugs found during audit:
 - `stop_reason_str` is stringly-typed (`&str`) where the rest of the codebase uses typed enums
 - ~~`which rg` check in `grep_exec` re-runs on every Grep call (no caching)~~ Fixed v0.0.14: cached via `OnceLock`
 - ~~Edit 100KB size limit only applies to the replace path, not create/append~~ Fixed v0.0.14: size check now covers all paths
+- ~~Glob tool schema description claimed "sorted by modification time"~~ Fixed v0.0.15: corrected to "in alphabetical order"
 - ~~`bash_exec` has no output size cap (unbounded accumulation until 120s timeout)~~ Fixed v0.0.14: 1MB cap with process kill
 - Bash schema declares `description` parameter that is never read by `bash_exec`
 

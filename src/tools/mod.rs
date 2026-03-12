@@ -37,7 +37,7 @@ tools! {
         "required": ["file_path"]
     });
 
-    "Glob", "List files matching a glob pattern. Returns up to 1000 entries sorted by modification time.",
+    "Glob", "List files matching a glob pattern. Returns up to 1000 entries in alphabetical order.",
     json!({
         "type": "object",
         "properties": {

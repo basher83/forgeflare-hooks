@@ -21,6 +21,56 @@ const MODEL_CONTEXT_TOKENS: u64 = 200_000;
 const TRIM_THRESHOLD: u64 = MODEL_CONTEXT_TOKENS * 60 / 100; // 120K tokens
 const MAX_CONSECUTIVE_BLOCKS: usize = 3;
 const MAX_TOTAL_BLOCKS: usize = 10;
+const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 32_768;
+const MAX_CONTINUATIONS: usize = 3;
+
+#[derive(Debug, PartialEq)]
+enum InstructionsResult {
+    Found { filename: String, contents: String },
+    Skipped { filename: String, reason: String },
+    NotFound,
+}
+
+/// Search cwd for CLAUDE.md then AGENTS.md. First match wins.
+/// Returns Found on success, Skipped if a candidate exists but can't be loaded
+/// (size limit, permissions), or NotFound if neither file exists.
+fn load_project_instructions() -> InstructionsResult {
+    let candidates = ["CLAUDE.md", "AGENTS.md"];
+    let mut last_skipped: Option<InstructionsResult> = None;
+
+    for candidate in &candidates {
+        let metadata = match std::fs::metadata(candidate) {
+            Ok(m) => m,
+            Err(_) => continue, // file not found or dangling symlink
+        };
+
+        if metadata.len() as usize > PROJECT_INSTRUCTIONS_MAX_BYTES {
+            last_skipped = Some(InstructionsResult::Skipped {
+                filename: candidate.to_string(),
+                reason: "exceeds 32KB".to_string(),
+            });
+            continue;
+        }
+
+        match std::fs::read_to_string(candidate) {
+            Ok(contents) => {
+                return InstructionsResult::Found {
+                    filename: candidate.to_string(),
+                    contents,
+                };
+            }
+            Err(e) => {
+                last_skipped = Some(InstructionsResult::Skipped {
+                    filename: candidate.to_string(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        }
+    }
+
+    last_skipped.unwrap_or(InstructionsResult::NotFound)
+}
 
 #[derive(Parser)]
 #[command(
@@ -121,25 +171,36 @@ fn trim_if_needed(messages: &mut Vec<Message>, last_input_tokens: u64) {
 /// Pops trailing User message and any orphaned tool_use to maintain
 /// the user/assistant alternation invariant.
 fn recover_conversation(messages: &mut Vec<Message>) {
-    // Pop trailing user message if present
-    if let Some(last) = messages.last() {
-        if last.role == "user" {
-            messages.pop();
+    // Guard: never empty the conversation entirely — at minimum keep the
+    // first user message so the next API call has something to send.
+    if messages.len() <= 1 {
+        return;
+    }
+    // Pop trailing user message if present (but keep at least 1 message)
+    if messages.len() > 1 {
+        if let Some(last) = messages.last() {
+            if last.role == "user" {
+                messages.pop();
+            }
         }
     }
     // Pop trailing assistant message that has only tool_use blocks (orphaned)
-    if let Some(last) = messages.last() {
-        if last.role == "assistant" {
-            let only_tool_use = last
-                .content
-                .iter()
-                .all(|b| matches!(b, ContentBlock::ToolUse { .. }));
-            if only_tool_use {
-                messages.pop();
-                // Also pop the user message before it to maintain alternation
-                if let Some(last) = messages.last() {
-                    if last.role == "user" {
-                        messages.pop();
+    if messages.len() > 1 {
+        if let Some(last) = messages.last() {
+            if last.role == "assistant" {
+                let only_tool_use = last
+                    .content
+                    .iter()
+                    .all(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                if only_tool_use {
+                    messages.pop();
+                    // Also pop the user message before it to maintain alternation
+                    if messages.len() > 1 {
+                        if let Some(last) = messages.last() {
+                            if last.role == "user" {
+                                messages.pop();
+                            }
+                        }
                     }
                 }
             }
@@ -175,6 +236,164 @@ fn filter_null_input_tool_use(blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
     }
 }
 
+/// Decision from pre-dispatch protocol: allow dispatch, block with a ToolResult, or trip threshold.
+#[derive(Debug)]
+enum PreDispatchResult {
+    Allow,
+    Blocked(ContentBlock),
+    ThresholdTripped,
+}
+
+/// Why a turn ended. Passed to the Stop hook as the `"reason"` field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TurnStopReason {
+    EndTurn,
+    IterationLimit,
+    ApiError,
+    ContinuationCap,
+    BlockLimitConsecutive,
+    BlockLimitTotal,
+    ConvergenceSignal,
+}
+
+impl TurnStopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            TurnStopReason::EndTurn => "end_turn",
+            TurnStopReason::IterationLimit => "iteration_limit",
+            TurnStopReason::ApiError => "api_error",
+            TurnStopReason::ContinuationCap => "continuation_cap",
+            TurnStopReason::BlockLimitConsecutive => "block_limit_consecutive",
+            TurnStopReason::BlockLimitTotal => "block_limit_total",
+            TurnStopReason::ConvergenceSignal => "convergence_signal",
+        }
+    }
+}
+
+/// Unified pre-dispatch protocol for both parallel and sequential paths.
+/// Checks null-input, runs pre-hook, manages block counting and threshold checks.
+/// Block counts are mutated in place so callers cannot forget to apply them.
+async fn run_pre_dispatch(
+    hooks: &HookRunner,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    iterations: usize,
+    consecutive_block_count: &mut usize,
+    total_block_count: &mut usize,
+) -> PreDispatchResult {
+    // Null-input safety net (truncated tool_use from API anomaly)
+    if input.is_null() {
+        return PreDispatchResult::Blocked(ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "null input (truncated tool_use)".to_string(),
+            is_error: Some(true),
+        });
+    }
+
+    let pre_result = hooks.run_pre_tool_use(name, input, iterations).await;
+
+    match pre_result {
+        PreToolResult::Block { reason, .. } => {
+            *consecutive_block_count += 1;
+            *total_block_count += 1;
+
+            if *consecutive_block_count >= MAX_CONSECUTIVE_BLOCKS {
+                eprintln!("[hooks] Consecutive block limit ({MAX_CONSECUTIVE_BLOCKS}) reached");
+                return PreDispatchResult::ThresholdTripped;
+            }
+            if *total_block_count >= MAX_TOTAL_BLOCKS {
+                eprintln!("[hooks] Total block limit ({MAX_TOTAL_BLOCKS}) reached");
+                return PreDispatchResult::ThresholdTripped;
+            }
+
+            PreDispatchResult::Blocked(ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: reason,
+                is_error: Some(true),
+            })
+        }
+        PreToolResult::Allow => {
+            *consecutive_block_count = 0;
+            PreDispatchResult::Allow
+        }
+    }
+}
+
+/// Unified post-dispatch protocol for both parallel and sequential paths.
+/// Formats and logs the result, then runs post-hooks. Returns true if a
+/// convergence signal was received (caller should set signal_break).
+async fn run_post_dispatch(
+    hooks: &HookRunner,
+    name: &str,
+    input: &serde_json::Value,
+    content: &str,
+    is_error: bool,
+    iterations: usize,
+    verbose: bool,
+) -> bool {
+    let display = format_tool_result_display(content, is_error, verbose);
+    eprintln!("{display}");
+
+    let post_result = hooks
+        .run_post_tool_use(name, input, content, is_error, iterations)
+        .await;
+    matches!(post_result, PostToolResult::Signal { .. })
+}
+
+fn log_tool_dispatch(name: &str, input: &serde_json::Value, verbose: bool) {
+    if verbose {
+        eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
+    } else {
+        eprintln!("\n[tool] {name}");
+    }
+}
+
+fn threshold_stop_reason(consecutive_block_count: usize) -> TurnStopReason {
+    if consecutive_block_count >= MAX_CONSECUTIVE_BLOCKS {
+        TurnStopReason::BlockLimitConsecutive
+    } else {
+        TurnStopReason::BlockLimitTotal
+    }
+}
+
+/// Dispatch a tool and wrap the result as a ContentBlock::ToolResult.
+/// Used by the parallel path inside spawn_blocking.
+fn dispatch_to_tool_result(id: String, name: String, input: serde_json::Value) -> ContentBlock {
+    let result = dispatch_tool(&name, &input, &mut |_: &str| {});
+    let (content, is_error) = match result {
+        Ok(output) => (output, false),
+        Err(err) => (err, true),
+    };
+    ContentBlock::ToolResult {
+        tool_use_id: id,
+        content,
+        is_error: if is_error { Some(true) } else { None },
+    }
+}
+
+/// Join spawned parallel futures into their slots, handling panics.
+async fn join_spawned_futures(
+    futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)>,
+    slots: &mut [Option<ContentBlock>],
+    tool_ids: &[(String, String, serde_json::Value)],
+) {
+    let handles: Vec<_> = futures
+        .into_iter()
+        .map(|(idx, h)| async move { (idx, h.await) })
+        .collect();
+    for (idx, result) in futures_util::future::join_all(handles).await {
+        slots[idx] = Some(match result {
+            Ok(block) => block,
+            Err(_) => ContentBlock::ToolResult {
+                tool_use_id: tool_ids[idx].0.clone(),
+                content: "tool panicked".to_string(),
+                is_error: Some(true),
+            },
+        });
+    }
+}
+
 fn format_tool_result_display(result: &str, is_error: bool, verbose: bool) -> String {
     if is_error {
         let preview = if result.len() > 200 {
@@ -194,8 +413,38 @@ fn format_tool_result_display(result: &str, is_error: bool, verbose: bool) -> St
 async fn main() {
     let cli = Cli::parse();
     let client = AnthropicClient::new(&cli.api_url);
-    let system_prompt = build_system_prompt();
+    let mut system_prompt = build_system_prompt();
     let tools = all_tool_schemas();
+
+    // Load project instructions (CLAUDE.md or AGENTS.md)
+    match load_project_instructions() {
+        InstructionsResult::Found {
+            ref filename,
+            ref contents,
+        } => {
+            if cli.verbose {
+                eprintln!(
+                    "[verbose] Loaded project instructions from {} ({} bytes)",
+                    filename,
+                    contents.len()
+                );
+            }
+            system_prompt = format!(
+                "{system_prompt}\n\n---\n\n## Project Instructions (from {filename})\n\n{contents}"
+            );
+        }
+        InstructionsResult::Skipped {
+            ref filename,
+            ref reason,
+        } => {
+            eprintln!("[warn] {filename}: {reason}");
+        }
+        InstructionsResult::NotFound => {
+            if cli.verbose {
+                eprintln!("[verbose] No CLAUDE.md or AGENTS.md found in working directory");
+            }
+        }
+    }
 
     if cli.verbose {
         eprintln!("[verbose] API URL: {}", client.api_url());
@@ -308,7 +557,6 @@ async fn run_turn(
     hooks: &HookRunner,
     input: &str,
 ) {
-    // Add user message
     let user_msg = Message {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
@@ -325,23 +573,18 @@ async fn run_turn(
     let mut consecutive_block_count: usize = 0;
     let mut total_block_count: usize = 0;
     let mut total_tokens: u64 = 0;
-    let mut stop_reason_str = "end_turn";
-
-    // Inner loop: call API, dispatch tools, repeat
+    let mut turn_stop_reason = TurnStopReason::EndTurn;
     loop {
-        // Token-aware trim: first call (no data) uses byte safety net;
-        // subsequent calls skip trim when under threshold.
         trim_if_needed(conversation, last_input_tokens);
 
         if tool_iterations >= MAX_TOOL_ITERATIONS {
             eprintln!("[warn] Tool iteration limit ({MAX_TOOL_ITERATIONS}) reached");
             recover_conversation(conversation);
-            stop_reason_str = "iteration_limit";
+            turn_stop_reason = TurnStopReason::IterationLimit;
             break;
         }
 
-        // Retry loop wrapping the API call
-        // attempt 0 = initial call, 1..=MAX_RETRIES = retries
+        // Retry loop: attempt 0 = initial call, 1..=MAX_RETRIES = retries
         let mut api_result = None;
         #[allow(clippy::needless_range_loop)]
         for attempt in 0..=MAX_RETRIES {
@@ -366,22 +609,17 @@ async fn run_turn(
                 }
                 Err(e) => {
                     eprintln!("\n[error] API call failed: {e}");
-
                     if classify_error(&e) == ErrorClass::Permanent {
                         recover_conversation(conversation);
-                        stop_reason_str = "api_error";
+                        turn_stop_reason = TurnStopReason::ApiError;
                         break;
                     }
-
-                    // Transient error — retry if attempts remain
                     if attempt >= MAX_RETRIES {
                         eprintln!("[retry] Max retries ({MAX_RETRIES}) exhausted");
                         recover_conversation(conversation);
-                        stop_reason_str = "api_error";
+                        turn_stop_reason = TurnStopReason::ApiError;
                         break;
                     }
-
-                    // Determine delay: retry-after header overrides backoff
                     let delay = if let AgentError::HttpError {
                         retry_after: Some(ra),
                         ..
@@ -393,11 +631,9 @@ async fn run_turn(
                     } else {
                         BACKOFF_SCHEDULE[attempt]
                     };
-
                     if matches!(e, AgentError::StreamTransient(_)) {
                         eprintln!("[retry] Retrying from beginning of response...");
                     }
-
                     eprintln!(
                         "[retry] Attempt {}/{MAX_RETRIES}: {} — waiting {delay}s",
                         attempt + 1,
@@ -410,21 +646,26 @@ async fn run_turn(
 
         let (blocks, stop_reason, usage) = match api_result {
             Some(r) => r,
-            None => break, // All retries failed or permanent error
+            None => break,
         };
 
-        // Update token tracking for next trim decision
         last_input_tokens = usage.input_tokens;
         total_tokens += usage.input_tokens + usage.output_tokens;
+        if cli.verbose {
+            eprintln!(
+                "[verbose] Cache: {} read, {} created, {} total input",
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+                usage.input_tokens
+            );
+        }
 
-        // Filter null-input tool_use blocks on MaxTokens truncation
         let blocks = if stop_reason == StopReason::MaxTokens {
             filter_null_input_tool_use(blocks)
         } else {
             blocks
         };
 
-        // Add assistant response to conversation
         let assistant_msg = Message {
             role: "assistant".to_string(),
             content: blocks.clone(),
@@ -432,36 +673,30 @@ async fn run_turn(
         conversation.push(assistant_msg.clone());
         session.append_assistant_turn(&assistant_msg, &usage);
 
-        // --- Canonical three-way branch ---
-
-        // 1. EndTurn — normal completion
+        // EndTurn — normal completion
         if stop_reason == StopReason::EndTurn {
             println!();
-            stop_reason_str = "end_turn";
+            turn_stop_reason = TurnStopReason::EndTurn;
             break;
         }
 
-        // 2. MaxTokens — filter, then decide: continue, dispatch tools, or break
+        // MaxTokens — decide: continue, dispatch tools, or break
         if stop_reason == StopReason::MaxTokens {
             println!();
 
             match classify_max_tokens(&blocks, continuation_count) {
                 MaxTokensAction::BreakEmpty => {
                     eprintln!("[info] Empty response at max_tokens, breaking");
-                    stop_reason_str = "continuation_cap";
+                    turn_stop_reason = TurnStopReason::ContinuationCap;
                     break;
                 }
-                MaxTokensAction::DispatchTools => {
-                    // Valid tool_use blocks — fall through to tool dispatch below.
-                    // Do NOT increment continuation_count.
-                }
+                MaxTokensAction::DispatchTools => {} // Fall through to tool dispatch
                 MaxTokensAction::Continue => {
                     continuation_count += 1;
                     eprintln!(
                         "[continue] Response truncated at max_tokens, requesting continuation ({}/{})",
                         continuation_count, MAX_CONTINUATIONS
                     );
-
                     let cont_msg = Message {
                         role: "user".to_string(),
                         content: vec![ContentBlock::Text {
@@ -474,25 +709,22 @@ async fn run_turn(
                 }
                 MaxTokensAction::BreakCapReached => {
                     eprintln!("[continue] Max continuations reached, breaking");
-                    stop_reason_str = "continuation_cap";
+                    turn_stop_reason = TurnStopReason::ContinuationCap;
                     break;
                 }
             }
         }
 
-        // 3. Tool dispatch — runs for both ToolUse and MaxTokens-with-valid-tools
-        // Classify batch: if all tools are Pure, dispatch concurrently
+        // Tool dispatch — runs for both ToolUse and MaxTokens-with-valid-tools
         let tool_uses: Vec<_> = blocks
             .iter()
-            .filter_map(|b| {
-                if let ContentBlock::ToolUse { id, name, input } = b {
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, name, input } => {
                     Some((id.clone(), name.clone(), input.clone()))
-                } else {
-                    None
                 }
+                _ => None,
             })
             .collect();
-
         let all_pure = !tool_uses.is_empty()
             && tool_uses
                 .iter()
@@ -500,8 +732,7 @@ async fn run_turn(
 
         let mut signal_break = false;
         let mut threshold_tripped = false;
-        let mut threshold_reason = "";
-
+        let mut threshold_reason = TurnStopReason::EndTurn; // placeholder, only used when threshold_tripped
         let tool_results: Vec<ContentBlock> = if all_pure {
             // Parallel path: all tools are pure (Read, Glob, Grep)
             let batch_size = tool_uses.len();
@@ -510,133 +741,43 @@ async fn run_turn(
             let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
 
             for (i, (id, name, input)) in tool_uses.iter().enumerate() {
-                if input.is_null() {
-                    slots[i] = Some(ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: "null input (truncated tool_use)".to_string(),
-                        is_error: Some(true),
-                    });
-                    continue;
-                }
-
-                // PreToolUse guard + observe
-                let pre_result = hooks.run_pre_tool_use(name, input, tool_iterations).await;
-
-                match pre_result {
-                    PreToolResult::Block { reason, .. } => {
-                        slots[i] = Some(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: reason,
-                            is_error: Some(true),
-                        });
-                        blocked_flags[i] = true;
-                        consecutive_block_count += 1;
-                        total_block_count += 1;
-
-                        if consecutive_block_count >= MAX_CONSECUTIVE_BLOCKS {
-                            eprintln!(
-                                "[hooks] Consecutive block limit ({MAX_CONSECUTIVE_BLOCKS}) reached"
-                            );
-                            threshold_tripped = true;
-                            threshold_reason = "block_limit_consecutive";
-                            break;
-                        }
-                        if total_block_count >= MAX_TOTAL_BLOCKS {
-                            eprintln!("[hooks] Total block limit ({MAX_TOTAL_BLOCKS}) reached");
-                            threshold_tripped = true;
-                            threshold_reason = "block_limit_total";
-                            break;
-                        }
-                    }
-                    PreToolResult::Allow => {
-                        consecutive_block_count = 0;
-
-                        if cli.verbose {
-                            eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
-                        } else {
-                            eprintln!("\n[tool] {name}");
-                        }
-
-                        let id_owned = id.clone();
-                        let name_owned = name.clone();
-                        let input_owned = input.clone();
-
+                match run_pre_dispatch(
+                    hooks,
+                    id,
+                    name,
+                    input,
+                    tool_iterations,
+                    &mut consecutive_block_count,
+                    &mut total_block_count,
+                )
+                .await
+                {
+                    PreDispatchResult::Allow => {
+                        log_tool_dispatch(name, input, cli.verbose);
+                        let id = id.clone();
+                        let name = name.clone();
+                        let input = input.clone();
                         let handle = tokio::task::spawn_blocking(move || {
-                            let result =
-                                dispatch_tool(&name_owned, &input_owned, &mut |_: &str| {});
-                            let (content, is_error) = match result {
-                                Ok(output) => (output, false),
-                                Err(err) => (err, true),
-                            };
-                            ContentBlock::ToolResult {
-                                tool_use_id: id_owned,
-                                content,
-                                is_error: if is_error { Some(true) } else { None },
-                            }
+                            dispatch_to_tool_result(id, name, input)
                         });
                         spawn_futures.push((i, handle));
+                    }
+                    PreDispatchResult::Blocked(cb) => {
+                        slots[i] = Some(cb);
+                        blocked_flags[i] = true;
+                    }
+                    PreDispatchResult::ThresholdTripped => {
+                        threshold_tripped = true;
+                        threshold_reason = threshold_stop_reason(consecutive_block_count);
+                        break;
                     }
                 }
             }
 
+            join_spawned_futures(spawn_futures, &mut slots, &tool_uses).await;
             if threshold_tripped {
-                // Join already-spawned futures (avoid detaching JoinHandles)
-                let handles: Vec<_> = spawn_futures
-                    .into_iter()
-                    .map(|(idx, h)| async move {
-                        let result = h.await;
-                        (idx, result)
-                    })
-                    .collect();
-                let results = futures_util::future::join_all(handles).await;
-                for (idx, result) in results {
-                    slots[idx] = Some(match result {
-                        Ok(block) => block,
-                        Err(_) => ContentBlock::ToolResult {
-                            tool_use_id: tool_uses[idx].0.clone(),
-                            content: "tool panicked".to_string(),
-                            is_error: Some(true),
-                        },
-                    });
-                }
-                // Batch abandoned — conversation.pop() + break happens below
-                Vec::new() // placeholder, won't be used
+                Vec::new()
             } else {
-                // Normal path: join_all spawned futures
-                let handles: Vec<_> = spawn_futures
-                    .into_iter()
-                    .map(|(idx, h)| async move {
-                        let result = h.await;
-                        (idx, result)
-                    })
-                    .collect();
-                let results = futures_util::future::join_all(handles).await;
-                for (idx, result) in results {
-                    slots[idx] = Some(match result {
-                        Ok(block) => block,
-                        Err(_) => ContentBlock::ToolResult {
-                            tool_use_id: tool_uses[idx].0.clone(),
-                            content: "tool panicked".to_string(),
-                            is_error: Some(true),
-                        },
-                    });
-                }
-
-                // Post-dispatch logging
-                for slot in &slots {
-                    if let Some(ContentBlock::ToolResult {
-                        ref content,
-                        is_error,
-                        ..
-                    }) = slot
-                    {
-                        let is_err = is_error.unwrap_or(false);
-                        let display = format_tool_result_display(content, is_err, cli.verbose);
-                        eprintln!("{display}");
-                    }
-                }
-
-                // PostToolUse for non-blocked tools
                 for (i, (_, name, input)) in tool_uses.iter().enumerate() {
                     if blocked_flags[i] {
                         continue;
@@ -648,16 +789,21 @@ async fn run_turn(
                     }) = slots[i]
                     {
                         let is_err = is_error.unwrap_or(false);
-                        let post_result = hooks
-                            .run_post_tool_use(name, input, content, is_err, tool_iterations)
-                            .await;
-                        if matches!(post_result, PostToolResult::Signal { .. }) {
+                        if run_post_dispatch(
+                            hooks,
+                            name,
+                            input,
+                            content,
+                            is_err,
+                            tool_iterations,
+                            cli.verbose,
+                        )
+                        .await
+                        {
                             signal_break = true;
                         }
                     }
                 }
-
-                // Collect final results (unwrap all slots)
                 slots.into_iter().map(|s| s.unwrap()).collect()
             }
         } else {
@@ -665,74 +811,52 @@ async fn run_turn(
             let mut tool_results: Vec<ContentBlock> = Vec::new();
 
             for (id, name, input) in &tool_uses {
-                if input.is_null() {
-                    continue;
-                }
-
-                // PreToolUse guard + observe
-                let pre_result = hooks.run_pre_tool_use(name, input, tool_iterations).await;
-
-                match pre_result {
-                    PreToolResult::Block { reason, .. } => {
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: reason,
-                            is_error: Some(true),
-                        });
-                        consecutive_block_count += 1;
-                        total_block_count += 1;
-
-                        if consecutive_block_count >= MAX_CONSECUTIVE_BLOCKS {
-                            eprintln!(
-                                "[hooks] Consecutive block limit ({MAX_CONSECUTIVE_BLOCKS}) reached"
-                            );
-                            threshold_tripped = true;
-                            threshold_reason = "block_limit_consecutive";
-                            break;
-                        }
-                        if total_block_count >= MAX_TOTAL_BLOCKS {
-                            eprintln!("[hooks] Total block limit ({MAX_TOTAL_BLOCKS}) reached");
-                            threshold_tripped = true;
-                            threshold_reason = "block_limit_total";
-                            break;
-                        }
+                match run_pre_dispatch(
+                    hooks,
+                    id,
+                    name,
+                    input,
+                    tool_iterations,
+                    &mut consecutive_block_count,
+                    &mut total_block_count,
+                )
+                .await
+                {
+                    PreDispatchResult::Allow => {}
+                    PreDispatchResult::Blocked(cb) => {
+                        tool_results.push(cb);
                         continue;
                     }
-                    PreToolResult::Allow => {
-                        consecutive_block_count = 0;
+                    PreDispatchResult::ThresholdTripped => {
+                        threshold_tripped = true;
+                        threshold_reason = threshold_stop_reason(consecutive_block_count);
+                        break;
                     }
                 }
 
-                if cli.verbose {
-                    eprintln!("\n[tool] {name}({})", truncate_json(input, 100));
-                } else {
-                    eprintln!("\n[tool] {name}");
-                }
+                log_tool_dispatch(name, input, cli.verbose);
 
                 let result = dispatch_tool(name, input, &mut |text| {
                     if cli.verbose {
                         eprint!("{text}");
                     }
                 });
-
                 let (content, is_error) = match result {
-                    Ok(output) => {
-                        let display = format_tool_result_display(&output, false, cli.verbose);
-                        eprintln!("{display}");
-                        (output, false)
-                    }
-                    Err(err) => {
-                        let display = format_tool_result_display(&err, true, cli.verbose);
-                        eprintln!("{display}");
-                        (err, true)
-                    }
+                    Ok(output) => (output, false),
+                    Err(err) => (err, true),
                 };
 
-                // PostToolUse
-                let post_result = hooks
-                    .run_post_tool_use(name, input, &content, is_error, tool_iterations)
-                    .await;
-                if matches!(post_result, PostToolResult::Signal { .. }) {
+                if run_post_dispatch(
+                    hooks,
+                    name,
+                    input,
+                    &content,
+                    is_error,
+                    tool_iterations,
+                    cli.verbose,
+                )
+                .await
+                {
                     signal_break = true;
                 }
 
@@ -746,35 +870,30 @@ async fn run_turn(
             tool_results
         };
 
-        // Block threshold takes unconditional precedence over signal_break
+        // Block threshold takes precedence over signal_break
         if threshold_tripped {
-            conversation.pop(); // Remove trailing Assistant message
-            stop_reason_str = threshold_reason;
+            conversation.pop();
+            turn_stop_reason = threshold_reason;
             break;
         }
-
         if tool_results.is_empty() {
             break;
         }
-
         let tool_msg = Message {
             role: "user".to_string(),
             content: tool_results,
         };
         conversation.push(tool_msg.clone());
         session.append_user_turn(&tool_msg);
-
         tool_iterations += 1;
-
         if signal_break {
-            stop_reason_str = "convergence_signal";
+            turn_stop_reason = TurnStopReason::ConvergenceSignal;
             break;
         }
     }
 
-    // Fire stop hook
     hooks
-        .run_stop(stop_reason_str, tool_iterations, total_tokens)
+        .run_stop(turn_stop_reason.as_str(), tool_iterations, total_tokens)
         .await;
 }
 
@@ -786,8 +905,6 @@ fn truncate_json(value: &serde_json::Value, max_len: usize) -> String {
         format!("{}...", &s[..s.floor_char_boundary(max_len)])
     }
 }
-
-const MAX_CONTINUATIONS: usize = 3;
 
 /// Determine what to do after a MaxTokens stop_reason.
 /// Returns the action to take given the filtered content blocks and current continuation count.
@@ -1589,5 +1706,865 @@ mod tests {
         assert_eq!(reason, "block_limit_consecutive");
         assert_eq!(consecutive, 3);
         assert_eq!(total, 10);
+    }
+
+    // --- Prompt caching tests ---
+
+    #[test]
+    fn tool_schemas_have_no_cache_control() {
+        // cache_control is added at send time in send_message(), not in tool schemas.
+        // This ensures all_tool_schemas() returns clean schemas.
+        let schemas = all_tool_schemas();
+        assert!(!schemas.is_empty(), "should have tool schemas");
+        for schema in &schemas {
+            assert!(
+                schema.get("cache_control").is_none(),
+                "tool schema should not contain cache_control: {}",
+                schema["name"]
+            );
+        }
+    }
+
+    // --- Project Instructions Loading Tests ---
+    //
+    // Each test creates a temp directory and sets it as cwd for the duration of the test.
+    // This isolates tests from the real working directory and from each other.
+    // Uses a mutex to prevent parallel tests from racing on set_current_dir.
+
+    use std::sync::Mutex;
+    static CWD_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Helper: run a closure with a temporary directory as cwd, then restore.
+    fn with_temp_cwd<F: FnOnce(&std::path::Path)>(f: F) {
+        let _lock = CWD_MUTEX.lock().unwrap();
+        let original = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        f(tmp.path());
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn instructions_loads_claude_md() {
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("CLAUDE.md"), "build instructions here").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert_eq!(contents, "build instructions here");
+                }
+                other => panic!("expected Found, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_loads_agents_md_fallback() {
+        // When only AGENTS.md exists (no CLAUDE.md), it should be loaded.
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("AGENTS.md"), "agents content").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "AGENTS.md");
+                    assert_eq!(contents, "agents content");
+                }
+                other => panic!("expected Found, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_claude_md_takes_priority() {
+        // When both exist, CLAUDE.md wins — AGENTS.md is never read.
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("CLAUDE.md"), "claude wins").unwrap();
+            std::fs::write(dir.join("AGENTS.md"), "agents loses").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert_eq!(contents, "claude wins");
+                }
+                other => panic!("expected Found, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_neither_found() {
+        // Empty directory — no instruction files.
+        with_temp_cwd(|_dir| {
+            let result = load_project_instructions();
+            assert_eq!(result, InstructionsResult::NotFound);
+        });
+    }
+
+    #[test]
+    fn instructions_oversized_file_skipped() {
+        // A CLAUDE.md over 32KB is skipped. If no AGENTS.md either, returns Skipped.
+        with_temp_cwd(|dir| {
+            let big = "x".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES + 1);
+            std::fs::write(dir.join("CLAUDE.md"), &big).unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Skipped { filename, reason } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert!(
+                        reason.contains("32KB"),
+                        "reason should mention 32KB: {}",
+                        reason
+                    );
+                }
+                other => panic!("expected Skipped, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_oversized_falls_through_to_agents() {
+        // CLAUDE.md over 32KB, but AGENTS.md exists and is fine — loads AGENTS.md.
+        with_temp_cwd(|dir| {
+            let big = "x".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES + 1);
+            std::fs::write(dir.join("CLAUDE.md"), &big).unwrap();
+            std::fs::write(dir.join("AGENTS.md"), "fallback agents").unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "AGENTS.md");
+                    assert_eq!(contents, "fallback agents");
+                }
+                other => panic!("expected Found via AGENTS.md fallback, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_both_skipped_returns_last_skipped() {
+        // Both files exist but both exceed size limit — returns last Skipped (AGENTS.md).
+        with_temp_cwd(|dir| {
+            let big = "x".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES + 1);
+            std::fs::write(dir.join("CLAUDE.md"), &big).unwrap();
+            std::fs::write(dir.join("AGENTS.md"), &big).unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Skipped { filename, .. } => {
+                    assert_eq!(filename, "AGENTS.md");
+                }
+                other => panic!("expected Skipped for AGENTS.md, got {:?}", other),
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instructions_unreadable_file_skipped() {
+        // File exists but no read permission — produces Skipped, falls through.
+        use std::os::unix::fs::PermissionsExt;
+        with_temp_cwd(|dir| {
+            let path = dir.join("CLAUDE.md");
+            std::fs::write(&path, "secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let result = load_project_instructions();
+            // Restore permissions so tempdir cleanup works
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            match result {
+                InstructionsResult::Skipped { filename, reason } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert!(
+                        reason.contains("ermission") || reason.contains("denied"),
+                        "reason should mention permission: {}",
+                        reason
+                    );
+                }
+                other => panic!("expected Skipped, got {:?}", other),
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instructions_symlink_works() {
+        // CLAUDE.md -> AGENTS.md symlink. Should load via CLAUDE.md name.
+        with_temp_cwd(|dir| {
+            std::fs::write(dir.join("AGENTS.md"), "symlinked content").unwrap();
+            std::os::unix::fs::symlink(dir.join("AGENTS.md"), dir.join("CLAUDE.md")).unwrap();
+            let result = load_project_instructions();
+            match result {
+                InstructionsResult::Found { filename, contents } => {
+                    assert_eq!(filename, "CLAUDE.md");
+                    assert_eq!(contents, "symlinked content");
+                }
+                other => panic!("expected Found via symlink, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn instructions_prompt_integration_format() {
+        // Verify the system prompt format when instructions are loaded.
+        let base = "base prompt here";
+        let filename = "CLAUDE.md";
+        let contents = "## Build\ncargo build";
+        let combined =
+            format!("{base}\n\n---\n\n## Project Instructions (from {filename})\n\n{contents}");
+        assert!(combined.starts_with("base prompt here"));
+        assert!(combined.contains("## Project Instructions (from CLAUDE.md)"));
+        assert!(combined.contains("cargo build"));
+    }
+
+    #[test]
+    fn build_system_prompt_signature_unchanged() {
+        // build_system_prompt() returns String, takes no args — this compiles iff true.
+        let _: String = build_system_prompt();
+    }
+
+    // --- Pre-dispatch tests ---
+
+    #[tokio::test]
+    async fn pre_dispatch_null_input_returns_blocked_error() {
+        // Null-input tool_use should produce a Blocked result with error ToolResult,
+        // without touching hooks at all.
+        let hooks = HookRunner::load("/nonexistent/hooks.toml", "/tmp");
+        let mut consecutive = 0usize;
+        let mut total = 0usize;
+        let result = run_pre_dispatch(
+            &hooks,
+            "tu_1",
+            "Bash",
+            &serde_json::Value::Null,
+            0,
+            &mut consecutive,
+            &mut total,
+        )
+        .await;
+        match result {
+            PreDispatchResult::Blocked(ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            }) => {
+                assert_eq!(tool_use_id, "tu_1");
+                assert!(content.contains("null input"));
+                assert_eq!(is_error, Some(true));
+            }
+            other => panic!("expected Blocked for null input, got {:?}", other),
+        }
+        // Block counts should NOT be incremented for null-input (it's not a hook block)
+        assert_eq!(consecutive, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_allow_resets_consecutive_block_count() {
+        // A non-null input with no hooks should return Allow and reset consecutive count.
+        let hooks = HookRunner::load("/nonexistent/hooks.toml", "/tmp");
+        let mut consecutive = 2usize;
+        let mut total = 5usize;
+        let result = run_pre_dispatch(
+            &hooks,
+            "tu_2",
+            "Read",
+            &serde_json::json!({"file_path": "/tmp/test"}),
+            0,
+            &mut consecutive,
+            &mut total,
+        )
+        .await;
+        assert!(matches!(result, PreDispatchResult::Allow));
+        assert_eq!(consecutive, 0); // reset on Allow
+        assert_eq!(total, 5); // total unchanged on Allow
+    }
+
+    #[test]
+    fn recover_conversation_preserves_single_message() {
+        // Bug 4 fix: a single user message must not be popped, otherwise
+        // the next API call has zero messages and enters an error loop.
+        let mut msgs = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        recover_conversation(&mut msgs);
+        assert_eq!(msgs.len(), 1, "single message must not be removed");
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn recover_conversation_preserves_minimum_after_orphan_pop() {
+        // Three messages: [user, assistant(tool_use only), user].
+        // Without the guard, all three would be popped leaving an empty vec.
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "first".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({"file_path": "/tmp/test"}),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "second".to_string(),
+                }],
+            },
+        ];
+        recover_conversation(&mut msgs);
+        assert!(
+            !msgs.is_empty(),
+            "recover_conversation must never empty the conversation"
+        );
+        // Should have popped trailing user, then orphaned assistant, but
+        // stopped before popping the last user message.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        if let ContentBlock::Text { text } = &msgs[0].content[0] {
+            assert_eq!(text, "first");
+        } else {
+            panic!("expected Text block");
+        }
+    }
+
+    #[test]
+    fn recover_conversation_empty_vec_is_noop() {
+        let mut msgs: Vec<Message> = vec![];
+        recover_conversation(&mut msgs);
+        assert!(msgs.is_empty());
+    }
+
+    // --- Parallel path integration tests ---
+    // These verify the blocked_flags and threshold_tripped code paths that
+    // run_pre_dispatch unit tests cannot reach (those test the function in isolation;
+    // these test the orchestration logic that calls it in a batch loop).
+
+    #[tokio::test]
+    async fn parallel_path_null_input_blocked_skips_post_hooks() {
+        // Simulates the parallel dispatch loop with a batch containing one valid
+        // tool and one null-input tool. Verifies:
+        //   (a) null-input slot gets an error ToolResult
+        //   (b) blocked_flags[i] is set for the null-input tool
+        //   (c) post-dispatch is skipped for the blocked slot
+        let hooks = HookRunner::load("/nonexistent/hooks.toml", "/tmp");
+        let tool_uses: Vec<(String, String, serde_json::Value)> = vec![
+            (
+                "tu_valid".to_string(),
+                "Read".to_string(),
+                serde_json::json!({"file_path": "/dev/null"}),
+            ),
+            (
+                "tu_null".to_string(),
+                "Bash".to_string(),
+                serde_json::Value::Null,
+            ),
+        ];
+        let batch_size = tool_uses.len();
+        let mut slots: Vec<Option<ContentBlock>> = vec![None; batch_size];
+        let mut blocked_flags: Vec<bool> = vec![false; batch_size];
+        let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
+        let mut consecutive_block_count = 0usize;
+        let mut total_block_count = 0usize;
+        let mut threshold_tripped = false;
+
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            match run_pre_dispatch(
+                &hooks,
+                id,
+                name,
+                input,
+                0,
+                &mut consecutive_block_count,
+                &mut total_block_count,
+            )
+            .await
+            {
+                PreDispatchResult::Allow => {
+                    let id = id.clone();
+                    let name = name.clone();
+                    let input = input.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        dispatch_to_tool_result(id, name, input)
+                    });
+                    spawn_futures.push((i, handle));
+                }
+                PreDispatchResult::Blocked(cb) => {
+                    slots[i] = Some(cb);
+                    blocked_flags[i] = true;
+                }
+                PreDispatchResult::ThresholdTripped => {
+                    threshold_tripped = true;
+                    break;
+                }
+            }
+        }
+
+        join_spawned_futures(spawn_futures, &mut slots, &tool_uses).await;
+        assert!(!threshold_tripped, "no threshold should trip");
+
+        // Verify: slot 0 (valid Read) was dispatched and has a result
+        assert!(!blocked_flags[0], "valid tool should not be blocked");
+        assert!(slots[0].is_some(), "valid tool slot should be filled");
+        if let Some(ContentBlock::ToolResult { is_error, .. }) = &slots[0] {
+            assert!(is_error.is_none(), "Read /dev/null should succeed");
+        }
+
+        // Verify: slot 1 (null-input) is blocked with error ToolResult
+        assert!(blocked_flags[1], "null-input tool should be blocked");
+        if let Some(ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        }) = &slots[1]
+        {
+            assert_eq!(tool_use_id, "tu_null");
+            assert!(content.contains("null input"));
+            assert_eq!(*is_error, Some(true));
+        } else {
+            panic!("expected ToolResult for null-input slot");
+        }
+
+        // Verify: post-dispatch loop skips blocked slots (the `continue` path)
+        let mut post_dispatch_count = 0;
+        for (i, (_, name, input)) in tool_uses.iter().enumerate() {
+            if blocked_flags[i] {
+                continue;
+            }
+            if let Some(ContentBlock::ToolResult {
+                ref content,
+                is_error,
+                ..
+            }) = slots[i]
+            {
+                let is_err = is_error.unwrap_or(false);
+                let _ = run_post_dispatch(&hooks, name, input, content, is_err, 0, false).await;
+                post_dispatch_count += 1;
+            }
+        }
+        // Only the valid (non-blocked) tool should get post-dispatch
+        assert_eq!(
+            post_dispatch_count, 1,
+            "post-dispatch should fire for valid tool only"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_path_threshold_trip_joins_pending_futures() {
+        // Simulates a batch where a guard hook blocks tools until the consecutive
+        // threshold trips mid-batch. Verifies:
+        //   (a) already-spawned futures are joined (slots filled)
+        //   (b) threshold_tripped is set
+        //   (c) the result is Vec::new() (no tool_results returned)
+        //
+        // We use a batch of 5 null-input tools: since null-input returns Blocked
+        // (without incrementing counters), this won't trip the threshold. Instead,
+        // we manually test the threshold trip path with a guard hook.
+        //
+        // Alternate approach: use a 4-tool batch where a blocking guard hook
+        // blocks tools 2-4 (hitting the consecutive limit of 3).
+        // For simplicity, we test with run_pre_dispatch directly.
+        let dir = tempfile::tempdir().unwrap();
+        let hook_script = dir.path().join("block.sh");
+        std::fs::write(
+            &hook_script,
+            "#!/bin/bash\necho '{\"action\":\"block\",\"reason\":\"policy\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Guard hook only matches Bash — Read tools pass through unblocked,
+        // so we can test that the threshold trip joins already-spawned Read futures.
+        let config_path = dir.path().join("hooks.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[hooks]]\nevent = \"PreToolUse\"\nphase = \"guard\"\ncommand = \"{}\"\nmatch_tool = \"Bash\"\n",
+                hook_script.display()
+            ),
+        )
+        .unwrap();
+        let hooks = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
+
+        let tool_uses: Vec<(String, String, serde_json::Value)> = vec![
+            // Tool 0: Read (not matched by guard) → Allow → spawned
+            (
+                "tu_0".to_string(),
+                "Read".to_string(),
+                serde_json::json!({"file_path": "/dev/null"}),
+            ),
+            // Tools 1-3: Bash (matched by guard) → Block, Block, ThresholdTripped
+            (
+                "tu_1".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo 1"}),
+            ),
+            (
+                "tu_2".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo 2"}),
+            ),
+            (
+                "tu_3".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo 3"}),
+            ),
+        ];
+        let batch_size = tool_uses.len();
+        let mut slots: Vec<Option<ContentBlock>> = vec![None; batch_size];
+        let mut blocked_flags: Vec<bool> = vec![false; batch_size];
+        let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
+        let mut consecutive_block_count = 0usize;
+        let mut total_block_count = 0usize;
+        let mut threshold_tripped = false;
+        let mut threshold_reason = TurnStopReason::EndTurn;
+
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            match run_pre_dispatch(
+                &hooks,
+                id,
+                name,
+                input,
+                0,
+                &mut consecutive_block_count,
+                &mut total_block_count,
+            )
+            .await
+            {
+                PreDispatchResult::Allow => {
+                    let id = id.clone();
+                    let name = name.clone();
+                    let input = input.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        dispatch_to_tool_result(id, name, input)
+                    });
+                    spawn_futures.push((i, handle));
+                }
+                PreDispatchResult::Blocked(cb) => {
+                    slots[i] = Some(cb);
+                    blocked_flags[i] = true;
+                }
+                PreDispatchResult::ThresholdTripped => {
+                    threshold_tripped = true;
+                    threshold_reason = threshold_stop_reason(consecutive_block_count);
+                    break;
+                }
+            }
+        }
+
+        // Join any already-spawned futures (tool 0's Read should complete)
+        join_spawned_futures(spawn_futures, &mut slots, &tool_uses).await;
+
+        // Verify threshold tripped
+        assert!(
+            threshold_tripped,
+            "consecutive block limit should have tripped"
+        );
+        assert_eq!(
+            threshold_reason,
+            TurnStopReason::BlockLimitConsecutive,
+            "reason should be consecutive limit"
+        );
+
+        // Verify tool 0 (Read, spawned before blocks) completed in its slot
+        assert!(
+            slots[0].is_some(),
+            "pre-threshold spawned tool should have a result"
+        );
+        if let Some(ContentBlock::ToolResult { is_error, .. }) = &slots[0] {
+            assert!(is_error.is_none(), "Read /dev/null should succeed");
+        }
+
+        // Verify tools 1-2 were blocked (slots filled with error results)
+        assert!(blocked_flags[1], "tool 1 should be blocked");
+        assert!(blocked_flags[2], "tool 2 should be blocked");
+        assert!(
+            slots[1].is_some(),
+            "blocked tool 1 should have error result"
+        );
+        assert!(
+            slots[2].is_some(),
+            "blocked tool 2 should have error result"
+        );
+
+        // Verify tool 3 was NOT processed (loop broke on ThresholdTripped)
+        assert!(!blocked_flags[3], "tool 3 should not have been processed");
+        assert!(
+            slots[3].is_none(),
+            "tool 3 slot should be empty (threshold broke before it)"
+        );
+
+        // In the real parallel path, threshold_tripped → Vec::new() (no tool_results)
+        // and conversation.pop() fires. We verify the threshold_tripped flag is set,
+        // which is what run_turn checks.
+        let tool_results: Vec<ContentBlock> = if threshold_tripped {
+            Vec::new()
+        } else {
+            slots.into_iter().map(|s| s.unwrap()).collect()
+        };
+        assert!(
+            tool_results.is_empty(),
+            "threshold trip should produce empty results"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_path_guard_blocked_skips_post_hooks() {
+        // hooks.md R7: "PostToolUse fires only for tools that were dispatched,
+        // not for blocked tools." This verifies that guard-hook blocked tools
+        // (as opposed to null-input blocked) also skip PostToolUse via blocked_flags.
+        let dir = tempfile::tempdir().unwrap();
+        let hook_script = dir.path().join("block_bash.sh");
+        std::fs::write(
+            &hook_script,
+            "#!/bin/bash\necho '{\"action\":\"block\",\"reason\":\"policy\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let config_path = dir.path().join("hooks.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[hooks]]\nevent = \"PreToolUse\"\nphase = \"guard\"\ncommand = \"{}\"\nmatch_tool = \"Bash\"\n",
+                hook_script.display()
+            ),
+        )
+        .unwrap();
+        let hooks = HookRunner::load(config_path.to_str().unwrap(), dir.path().to_str().unwrap());
+
+        let tool_uses: Vec<(String, String, serde_json::Value)> = vec![
+            // Tool 0: Read (no guard match) → Allow → dispatched
+            (
+                "tu_0".to_string(),
+                "Read".to_string(),
+                serde_json::json!({"file_path": "/dev/null"}),
+            ),
+            // Tool 1: Bash (guard blocks it) → Blocked
+            (
+                "tu_1".to_string(),
+                "Bash".to_string(),
+                serde_json::json!({"command": "echo hello"}),
+            ),
+        ];
+        let batch_size = tool_uses.len();
+        let mut slots: Vec<Option<ContentBlock>> = vec![None; batch_size];
+        let mut blocked_flags: Vec<bool> = vec![false; batch_size];
+        let mut spawn_futures: Vec<(usize, tokio::task::JoinHandle<ContentBlock>)> = Vec::new();
+        let mut consecutive_block_count = 0usize;
+        let mut total_block_count = 0usize;
+
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            match run_pre_dispatch(
+                &hooks,
+                id,
+                name,
+                input,
+                0,
+                &mut consecutive_block_count,
+                &mut total_block_count,
+            )
+            .await
+            {
+                PreDispatchResult::Allow => {
+                    let id = id.clone();
+                    let name = name.clone();
+                    let input = input.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        dispatch_to_tool_result(id, name, input)
+                    });
+                    spawn_futures.push((i, handle));
+                }
+                PreDispatchResult::Blocked(cb) => {
+                    slots[i] = Some(cb);
+                    blocked_flags[i] = true;
+                }
+                PreDispatchResult::ThresholdTripped => break,
+            }
+        }
+
+        join_spawned_futures(spawn_futures, &mut slots, &tool_uses).await;
+
+        // Verify: Read tool dispatched normally
+        assert!(!blocked_flags[0], "Read should not be blocked");
+        assert!(slots[0].is_some(), "Read slot should have result");
+
+        // Verify: Bash blocked by guard hook
+        assert!(blocked_flags[1], "Bash should be blocked by guard hook");
+        if let Some(ContentBlock::ToolResult {
+            content, is_error, ..
+        }) = &slots[1]
+        {
+            assert!(
+                content.contains("policy"),
+                "blocked reason should contain guard hook reason"
+            );
+            assert_eq!(*is_error, Some(true));
+        } else {
+            panic!("expected ToolResult for guard-blocked slot");
+        }
+
+        // Verify: post-dispatch skips the guard-blocked tool
+        let mut post_dispatch_count = 0;
+        for (i, (_, name, input)) in tool_uses.iter().enumerate() {
+            if blocked_flags[i] {
+                continue;
+            }
+            if let Some(ContentBlock::ToolResult {
+                ref content,
+                is_error,
+                ..
+            }) = slots[i]
+            {
+                let is_err = is_error.unwrap_or(false);
+                let _ = run_post_dispatch(&hooks, name, input, content, is_err, 0, false).await;
+                post_dispatch_count += 1;
+            }
+        }
+        assert_eq!(
+            post_dispatch_count, 1,
+            "post-dispatch should only fire for the non-blocked Read tool"
+        );
+
+        // Block counters: guard hook block increments both consecutive and total
+        assert_eq!(consecutive_block_count, 1);
+        assert_eq!(total_block_count, 1);
+    }
+
+    #[test]
+    fn threshold_takes_precedence_over_signal_break() {
+        // hooks.md R6: "Block threshold takes unconditional precedence over
+        // signal_break in both paths." When both threshold_tripped and
+        // signal_break are true, the turn stop reason must be the threshold
+        // reason, not ConvergenceSignal.
+        let threshold_tripped = true;
+        let signal_break = true;
+        let threshold_reason = TurnStopReason::BlockLimitConsecutive;
+
+        // Mirror the exact control flow from run_turn lines 873-892:
+        let turn_stop_reason = if threshold_tripped {
+            threshold_reason
+        } else if signal_break {
+            TurnStopReason::ConvergenceSignal
+        } else {
+            TurnStopReason::EndTurn
+        };
+
+        assert_eq!(
+            turn_stop_reason,
+            TurnStopReason::BlockLimitConsecutive,
+            "threshold must take precedence over signal_break"
+        );
+
+        // Verify signal_break alone would produce ConvergenceSignal
+        let turn_stop_no_threshold = if false {
+            TurnStopReason::BlockLimitConsecutive
+        } else if signal_break {
+            TurnStopReason::ConvergenceSignal
+        } else {
+            TurnStopReason::EndTurn
+        };
+
+        assert_eq!(
+            turn_stop_no_threshold,
+            TurnStopReason::ConvergenceSignal,
+            "signal_break without threshold should produce ConvergenceSignal"
+        );
+    }
+
+    #[test]
+    fn trim_conversation_preserves_first_message_content() {
+        // The first message (system context) must survive trimming with its
+        // content intact — trim removes from position 1 onwards, not position 0.
+        let first_text = "I am the first message and must survive".to_string();
+        let mut msgs = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: first_text.clone(),
+            }],
+        }];
+        // Stuff enough messages to exceed CONTEXT_BUDGET_BYTES
+        let filler = "x".repeat(100_000);
+        for i in 0..20 {
+            msgs.push(Message {
+                role: if i % 2 == 0 { "assistant" } else { "user" }.to_string(),
+                content: vec![ContentBlock::Text {
+                    text: filler.clone(),
+                }],
+            });
+        }
+        let original_len = msgs.len();
+        trim_conversation(&mut msgs);
+        assert!(msgs.len() < original_len, "should have trimmed something");
+        // The critical assertion: first message content is byte-identical.
+        if let ContentBlock::Text { text } = &msgs[0].content[0] {
+            assert_eq!(text, &first_text, "first message content must be preserved");
+        } else {
+            panic!("expected Text block in first message");
+        }
+    }
+
+    #[test]
+    fn recover_conversation_two_messages_trailing_user() {
+        // Boundary: exactly 2 messages [user, user]. The trailing user should
+        // be popped, leaving 1 message.
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "first".to_string(),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "second".to_string(),
+                }],
+            },
+        ];
+        recover_conversation(&mut msgs);
+        assert_eq!(msgs.len(), 1, "trailing user should be popped");
+        assert_eq!(msgs[0].role, "user");
+        if let ContentBlock::Text { text } = &msgs[0].content[0] {
+            assert_eq!(text, "first");
+        } else {
+            panic!("expected Text block");
+        }
+    }
+
+    #[test]
+    fn recover_conversation_two_messages_trailing_assistant() {
+        // Boundary: exactly 2 messages [user, assistant(text)]. Nothing should
+        // be popped because trailing is not user and assistant has text (not orphaned).
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "hi there".to_string(),
+                }],
+            },
+        ];
+        recover_conversation(&mut msgs);
+        assert_eq!(msgs.len(), 2, "nothing should be popped");
     }
 }

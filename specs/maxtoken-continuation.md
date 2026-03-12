@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # MaxTokens Continuation
 
-**Status:** Active
 **Target:** Recover from MaxTokens truncation by prompting the LLM to continue instead of breaking the inner loop
 
 ---

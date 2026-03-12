@@ -1,6 +1,10 @@
+---
+status: Complete
+created: 2026-02-14
+---
+
 # Hook Dispatch Layer
 
-**Status:** Active
 **Target:** Shell-based hook system with three lifecycle events for Ralph loop integration — guard before execution, observe after execution, finalize on stop
 
 ---

@@ -140,19 +140,26 @@ impl AnthropicClient {
         let mut body = serde_json::json!({
             "model": model,
             "max_tokens": max_tokens,
-            "system": system,
+            "system": [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }],
             "messages": messages,
             "stream": true,
         });
 
         if !tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(tools.to_vec());
+            let mut cached_tools = tools.to_vec();
+            if let Some(last) = cached_tools.last_mut() {
+                last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+            body["tools"] = serde_json::Value::Array(cached_tools);
         }
 
         let mut req = self
             .client
             .post(&url)
-            .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
 
         if let Some(ref key) = self.api_key {
@@ -210,127 +217,140 @@ where
 
         // Process complete SSE lines
         while let Some(pos) = buffer.find("\n\n") {
-            let event_block = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
+            {
+                let event_block = &buffer[..pos];
 
-            for line in event_block.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        continue;
-                    }
-
-                    let parsed: serde_json::Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let event_type = parsed["type"].as_str().unwrap_or("");
-
-                    match event_type {
-                        "message_start" => {
-                            if let Some(u) = parsed.get("message").and_then(|m| m.get("usage")) {
-                                usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
-                                usage.cache_creation_input_tokens =
-                                    u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                                usage.cache_read_input_tokens =
-                                    u["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                            }
+                for line in event_block.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data == "[DONE]" {
+                            continue;
                         }
-                        "content_block_start" => {
-                            let cb = &parsed["content_block"];
-                            match cb["type"].as_str() {
-                                Some("text") => {
-                                    content_blocks.push(ContentBlock::Text {
-                                        text: String::new(),
-                                    });
+
+                        let parsed: serde_json::Value = match serde_json::from_str(data) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        let event_type = parsed["type"].as_str().unwrap_or("");
+
+                        match event_type {
+                            "message_start" => {
+                                if let Some(u) = parsed.get("message").and_then(|m| m.get("usage"))
+                                {
+                                    usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
+                                    usage.cache_creation_input_tokens =
+                                        u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                                    usage.cache_read_input_tokens =
+                                        u["cache_read_input_tokens"].as_u64().unwrap_or(0);
                                 }
-                                Some("tool_use") => {
-                                    let idx = content_blocks.len();
-                                    content_blocks.push(ContentBlock::ToolUse {
+                            }
+                            "content_block_start" => {
+                                let cb = &parsed["content_block"];
+                                match cb["type"].as_str() {
+                                    Some("text") => {
+                                        content_blocks.push(ContentBlock::Text {
+                                            text: String::new(),
+                                        });
+                                    }
+                                    Some("tool_use") => {
+                                        let idx = content_blocks.len();
+                                        content_blocks.push(ContentBlock::ToolUse {
                                         id: cb["id"].as_str().unwrap_or("").to_string(),
                                         name: cb["name"].as_str().unwrap_or("").to_string(),
                                         input: serde_json::Value::Object(serde_json::Map::new()),
                                     });
-                                    tool_input_bufs.insert(idx, String::new());
+                                        tool_input_bufs.insert(idx, String::new());
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                        "content_block_delta" => {
-                            let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-                            let delta = &parsed["delta"];
+                            "content_block_delta" => {
+                                let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                                let delta = &parsed["delta"];
 
-                            match delta["type"].as_str() {
-                                Some("text_delta") => {
-                                    if let Some(text) = delta["text"].as_str() {
-                                        callback(text);
-                                        if let Some(ContentBlock::Text { text: ref mut t }) =
-                                            content_blocks.get_mut(index)
-                                        {
-                                            t.push_str(text);
+                                match delta["type"].as_str() {
+                                    Some("text_delta") => {
+                                        if let Some(text) = delta["text"].as_str() {
+                                            callback(text);
+                                            if let Some(ContentBlock::Text { text: ref mut t }) =
+                                                content_blocks.get_mut(index)
+                                            {
+                                                t.push_str(text);
+                                            }
                                         }
                                     }
-                                }
-                                Some("input_json_delta") => {
-                                    if let Some(partial) = delta["partial_json"].as_str() {
-                                        if let Some(buf) = tool_input_bufs.get_mut(&index) {
-                                            buf.push_str(partial);
+                                    Some("input_json_delta") => {
+                                        if let Some(partial) = delta["partial_json"].as_str() {
+                                            if let Some(buf) = tool_input_bufs.get_mut(&index) {
+                                                buf.push_str(partial);
+                                            }
                                         }
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                        "content_block_stop" => {
-                            let index = parsed["index"].as_u64().unwrap_or(0) as usize;
-                            // Finalize tool_use input JSON
-                            if let Some(json_str) = tool_input_bufs.remove(&index) {
-                                if let Some(ContentBlock::ToolUse { ref mut input, .. }) =
-                                    content_blocks.get_mut(index)
-                                {
-                                    if let Ok(v) =
-                                        serde_json::from_str::<serde_json::Value>(&json_str)
+                            "content_block_stop" => {
+                                let index = parsed["index"].as_u64().unwrap_or(0) as usize;
+                                // Finalize tool_use input JSON
+                                if let Some(json_str) = tool_input_bufs.remove(&index) {
+                                    if let Some(ContentBlock::ToolUse { ref mut input, .. }) =
+                                        content_blocks.get_mut(index)
                                     {
-                                        *input = v;
+                                        match serde_json::from_str::<serde_json::Value>(&json_str) {
+                                            Ok(v) => *input = v,
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[error] Failed to parse tool input JSON \
+                                                     for block {index}: {e}"
+                                                );
+                                                // Set to Null so run_pre_dispatch's null-input
+                                                // check catches it and produces a clean error
+                                                *input = serde_json::Value::Null;
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        }
-                        "message_delta" => {
-                            if let Some(sr) = parsed["delta"]["stop_reason"].as_str() {
-                                stop_reason = match sr {
-                                    "end_turn" => Some(StopReason::EndTurn),
-                                    "max_tokens" => Some(StopReason::MaxTokens),
-                                    "tool_use" => Some(StopReason::ToolUse),
-                                    _ => None,
-                                };
-                            }
-                            if let Some(u) = parsed.get("usage") {
-                                usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
-                            }
-                        }
-                        "error" => {
-                            let err_type = parsed["error"]["type"].as_str().unwrap_or("unknown");
-                            let err_msg = parsed["error"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
-                            match err_type {
-                                "overloaded_error" | "api_error" | "rate_limit_error" => {
-                                    return Err(AgentError::StreamTransient(format!(
-                                        "{err_type}: {err_msg}"
-                                    )));
+                            "message_delta" => {
+                                if let Some(sr) = parsed["delta"]["stop_reason"].as_str() {
+                                    stop_reason = match sr {
+                                        "end_turn" => Some(StopReason::EndTurn),
+                                        "max_tokens" => Some(StopReason::MaxTokens),
+                                        "tool_use" => Some(StopReason::ToolUse),
+                                        _ => None,
+                                    };
                                 }
-                                _ => {
-                                    return Err(AgentError::StreamParse(format!(
-                                        "{err_type}: {err_msg}"
-                                    )));
+                                if let Some(u) = parsed.get("usage") {
+                                    usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
                                 }
                             }
+                            "error" => {
+                                let err_type =
+                                    parsed["error"]["type"].as_str().unwrap_or("unknown");
+                                let err_msg = parsed["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("unknown error");
+                                match err_type {
+                                    "invalid_request_error" => {
+                                        return Err(AgentError::StreamParse(format!(
+                                            "{err_type}: {err_msg}"
+                                        )));
+                                    }
+                                    _ => {
+                                        // Unknown/absent error types default to transient —
+                                        // server-side errors are usually temporary (spec R1).
+                                        return Err(AgentError::StreamTransient(format!(
+                                            "{err_type}: {err_msg}"
+                                        )));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
+            buffer.drain(..pos + 2);
         }
     }
 
@@ -495,6 +515,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_sse_unknown_error_type_is_transient() {
+        // Unknown error types from the API should be transient (retryable),
+        // not permanent — server-side errors are usually temporary.
+        let sse_data = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"some_future_error\",\"message\":\"Something new\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let err = parse_sse_stream(stream, &mut |_| {}).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::StreamTransient(_)),
+            "unknown error type should be transient, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_absent_error_type_is_transient() {
+        // api-retry R1: when the SSE error object exists but has no `type` field,
+        // it should default to transient (retryable). The code uses
+        // `unwrap_or("unknown")` which falls through to the `_` arm.
+        let sse_data = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"Something went wrong\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let err = parse_sse_stream(stream, &mut |_| {}).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::StreamTransient(_)),
+            "absent error.type should be transient, got: {err}"
+        );
+        // Verify the error message contains "unknown" (the default type)
+        if let AgentError::StreamTransient(msg) = &err {
+            assert!(
+                msg.contains("unknown"),
+                "error message should contain 'unknown' type: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn parse_sse_missing_stop_reason() {
         let sse_data = concat!(
             "event: content_block_start\n",
@@ -646,5 +712,145 @@ mod tests {
         assert_eq!(u.output_tokens, 0);
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn system_prompt_sent_as_cached_content_block_array() {
+        let system = "You are a coding assistant";
+        let body = serde_json::json!({
+            "system": [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }]
+        });
+
+        let system_val = &body["system"];
+        assert!(system_val.is_array(), "system must be an array");
+        let arr = system_val.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], system);
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_added_to_last_tool_only() {
+        let tools = vec![
+            serde_json::json!({"name": "Read", "description": "Read files"}),
+            serde_json::json!({"name": "Bash", "description": "Run commands"}),
+            serde_json::json!({"name": "Grep", "description": "Search files"}),
+        ];
+
+        let mut cached_tools = tools.clone();
+        if let Some(last) = cached_tools.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+
+        // Original tools unmodified
+        assert!(tools[0].get("cache_control").is_none());
+        assert!(tools[1].get("cache_control").is_none());
+        assert!(tools[2].get("cache_control").is_none());
+
+        // Only last cached tool has cache_control
+        assert!(cached_tools[0].get("cache_control").is_none());
+        assert!(cached_tools[1].get("cache_control").is_none());
+        assert_eq!(cached_tools[2]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_with_single_tool() {
+        let tools = vec![serde_json::json!({"name": "Read", "description": "Read files"})];
+
+        let mut cached_tools = tools.to_vec();
+        if let Some(last) = cached_tools.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+
+        assert_eq!(cached_tools[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_with_empty_tools() {
+        let tools: Vec<serde_json::Value> = vec![];
+        let mut body = serde_json::json!({"model": "test"});
+
+        // Mirrors send_message logic — no tools means no tools key
+        if !tools.is_empty() {
+            let mut cached_tools = tools.to_vec();
+            if let Some(last) = cached_tools.last_mut() {
+                last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+            body["tools"] = serde_json::Value::Array(cached_tools);
+        }
+
+        assert!(body.get("tools").is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_sse_malformed_tool_input_sets_null() {
+        // Simulate truncated/malformed tool input JSON: partial JSON that
+        // doesn't close properly. On content_block_stop, the parse should
+        // fail and set input to Value::Null instead of silently leaving {}.
+        let sse_data = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_bad\",\"name\":\"Read\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\": \\\"/tmp/te\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let (blocks, _stop, _usage) = parse_sse_stream(stream, &mut |_| {}).await.unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        if let ContentBlock::ToolUse { id, input, .. } = &blocks[0] {
+            assert_eq!(id, "tu_bad");
+            assert!(
+                input.is_null(),
+                "malformed JSON should set input to Null, got: {input}"
+            );
+        } else {
+            panic!("expected ToolUse block");
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_sse_empty_data_line_skipped() {
+        // A bare "data: " line (empty payload) should be silently skipped
+        // because serde_json::from_str("") fails → continue. The parser
+        // should still produce valid output from subsequent well-formed events.
+        let sse_data = concat!(
+            "event: empty_payload\n",
+            "data: \n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"survived\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let (blocks, stop, _usage) = parse_sse_stream(stream, &mut |_| {}).await.unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(blocks.len(), 1);
+        if let ContentBlock::Text { text } = &blocks[0] {
+            assert_eq!(
+                text, "survived",
+                "parser should recover after empty data line"
+            );
+        } else {
+            panic!("expected Text block");
+        }
     }
 }

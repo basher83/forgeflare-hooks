@@ -1,0 +1,9 @@
+run forge-loop-preflight skill, repo is scaffolded items need verification
+
+---
+
+yup, lets fix spec frontmatter across all 16 first
+
+---
+
+lets rebase

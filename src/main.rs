@@ -170,25 +170,36 @@ fn trim_if_needed(messages: &mut Vec<Message>, last_input_tokens: u64) {
 /// Pops trailing User message and any orphaned tool_use to maintain
 /// the user/assistant alternation invariant.
 fn recover_conversation(messages: &mut Vec<Message>) {
-    // Pop trailing user message if present
-    if let Some(last) = messages.last() {
-        if last.role == "user" {
-            messages.pop();
+    // Guard: never empty the conversation entirely — at minimum keep the
+    // first user message so the next API call has something to send.
+    if messages.len() <= 1 {
+        return;
+    }
+    // Pop trailing user message if present (but keep at least 1 message)
+    if messages.len() > 1 {
+        if let Some(last) = messages.last() {
+            if last.role == "user" {
+                messages.pop();
+            }
         }
     }
     // Pop trailing assistant message that has only tool_use blocks (orphaned)
-    if let Some(last) = messages.last() {
-        if last.role == "assistant" {
-            let only_tool_use = last
-                .content
-                .iter()
-                .all(|b| matches!(b, ContentBlock::ToolUse { .. }));
-            if only_tool_use {
-                messages.pop();
-                // Also pop the user message before it to maintain alternation
-                if let Some(last) = messages.last() {
-                    if last.role == "user" {
-                        messages.pop();
+    if messages.len() > 1 {
+        if let Some(last) = messages.last() {
+            if last.role == "assistant" {
+                let only_tool_use = last
+                    .content
+                    .iter()
+                    .all(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                if only_tool_use {
+                    messages.pop();
+                    // Also pop the user message before it to maintain alternation
+                    if messages.len() > 1 {
+                        if let Some(last) = messages.last() {
+                            if last.role == "user" {
+                                messages.pop();
+                            }
+                        }
                     }
                 }
             }
@@ -1939,5 +1950,69 @@ mod tests {
         assert!(matches!(result, PreDispatchResult::Allow));
         assert_eq!(consecutive, 0); // reset on Allow
         assert_eq!(total, 5); // total unchanged on Allow
+    }
+
+    #[test]
+    fn recover_conversation_preserves_single_message() {
+        // Bug 4 fix: a single user message must not be popped, otherwise
+        // the next API call has zero messages and enters an error loop.
+        let mut msgs = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        recover_conversation(&mut msgs);
+        assert_eq!(msgs.len(), 1, "single message must not be removed");
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn recover_conversation_preserves_minimum_after_orphan_pop() {
+        // Three messages: [user, assistant(tool_use only), user].
+        // Without the guard, all three would be popped leaving an empty vec.
+        let mut msgs = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "first".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({"file_path": "/tmp/test"}),
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "second".to_string(),
+                }],
+            },
+        ];
+        recover_conversation(&mut msgs);
+        assert!(
+            !msgs.is_empty(),
+            "recover_conversation must never empty the conversation"
+        );
+        // Should have popped trailing user, then orphaned assistant, but
+        // stopped before popping the last user message.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        if let ContentBlock::Text { text } = &msgs[0].content[0] {
+            assert_eq!(text, "first");
+        } else {
+            panic!("expected Text block");
+        }
+    }
+
+    #[test]
+    fn recover_conversation_empty_vec_is_noop() {
+        let mut msgs: Vec<Message> = vec![];
+        recover_conversation(&mut msgs);
+        assert!(msgs.is_empty());
     }
 }

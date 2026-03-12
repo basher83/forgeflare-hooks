@@ -1,12 +1,12 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. 153 tests pass, clippy clean, fmt clean.
+Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. 157 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
 Updated 2026-03-11: Phase 2 item 2 (SSE Buffer Optimization) complete. Replaced two `.to_string()` allocations with slice borrow + `drain()` in `parse_sse_stream`. All 6 SSE parser tests pass unchanged.
 Updated 2026-03-12: Phase 2 item 4 (Project Instructions Loading) complete. InstructionsResult enum, load_project_instructions() function, wired into main() with verbose/warn logging, 11 new tests (CLAUDE.md load, AGENTS.md fallback, priority, symlinks, oversized skip, unreadable skip, both skipped, prompt format, signature unchanged). All 151 tests pass, clippy clean, fmt clean.
-Updated 2026-03-12: Phase 2 item 5 (Run Turn Refactor) complete. Extracted run_pre_dispatch() and run_post_dispatch() from duplicated parallel/sequential paths. Fixed two pre-existing bugs: null-input silent skip in sequential path now produces error ToolResult, null-input in parallel path now sets blocked_flags preventing spurious post-hooks. run_turn reduced from 479 to 349 lines. 2 new tests (pre_dispatch_null_input, pre_dispatch_allow_resets). All 153 tests pass, clippy clean, fmt clean.
+Updated 2026-03-12: Pre-existing bugs 3 and 4 fixed (v0.0.13). Bug 3: malformed tool input JSON now sets input to Null (was silently left as `{}`) with stderr error log; downstream null-input check produces clean error ToolResult. Bug 4: recover_conversation now guards `messages.len() > 1` before each pop, preventing conversation from being emptied. 4 new tests. All 157 tests pass, clippy clean, fmt clean.
 
 ## Phase 2 — Active (ordered by priority)
 
@@ -83,8 +83,8 @@ These are NOT Phase 2 spec items but bugs found during audit:
 
 1. **Null-input silent skip in sequential path** (`main.rs:668-670`): `continue` produces no ToolResult. The API expects a tool_result for every tool_use. Fixed by item 5 (v0.0.12).
 2. **Missing blocked_flags for null-input in parallel path** (`main.rs:513-519`): Post-hooks fire on error results for tools that never executed. Fixed by item 5 (v0.0.12).
-3. **Tool input JSON parse failure silently swallowed** (`api.rs:291-295`): `if let Ok(v)` silently drops parse errors, leaving ToolUse with `input: {}`. Not addressed by any spec.
-4. **`recover_conversation` can empty the conversation** (`main.rs:139-145`): Cascading pops have no minimum-length guard. Not addressed by any spec.
+3. **Tool input JSON parse failure silently swallowed** (`api.rs:299`): `if let Ok(v)` replaced with `match` — parse errors now log to stderr and set input to `Value::Null`, caught by `run_pre_dispatch` null-input check. Fixed (v0.0.13).
+4. **`recover_conversation` can empty the conversation** (`main.rs:172`): Added `messages.len() > 1` guard before each pop operation. Fixed (v0.0.13).
 
 ## Completed Items (Phase 1)
 

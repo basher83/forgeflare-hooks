@@ -296,10 +296,17 @@ where
                                     if let Some(ContentBlock::ToolUse { ref mut input, .. }) =
                                         content_blocks.get_mut(index)
                                     {
-                                        if let Ok(v) =
-                                            serde_json::from_str::<serde_json::Value>(&json_str)
-                                        {
-                                            *input = v;
+                                        match serde_json::from_str::<serde_json::Value>(&json_str) {
+                                            Ok(v) => *input = v,
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[error] Failed to parse tool input JSON \
+                                                     for block {index}: {e}"
+                                                );
+                                                // Set to Null so run_pre_dispatch's null-input
+                                                // check catches it and produces a clean error
+                                                *input = serde_json::Value::Null;
+                                            }
                                         }
                                     }
                                 }
@@ -730,5 +737,38 @@ mod tests {
         }
 
         assert!(body.get("tools").is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_sse_malformed_tool_input_sets_null() {
+        // Simulate truncated/malformed tool input JSON: partial JSON that
+        // doesn't close properly. On content_block_stop, the parse should
+        // fail and set input to Value::Null instead of silently leaving {}.
+        let sse_data = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_bad\",\"name\":\"Read\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\": \\\"/tmp/te\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        );
+
+        let stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse_data))]);
+
+        let (blocks, _stop, _usage) = parse_sse_stream(stream, &mut |_| {}).await.unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        if let ContentBlock::ToolUse { id, input, .. } = &blocks[0] {
+            assert_eq!(id, "tu_bad");
+            assert!(
+                input.is_null(),
+                "malformed JSON should set input to Null, got: {input}"
+            );
+        } else {
+            panic!("expected ToolUse block");
+        }
     }
 }

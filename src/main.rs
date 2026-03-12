@@ -417,6 +417,15 @@ async fn run_turn(
         last_input_tokens = usage.input_tokens;
         total_tokens += usage.input_tokens + usage.output_tokens;
 
+        if cli.verbose {
+            eprintln!(
+                "[verbose] Cache: {} read, {} created, {} total input",
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+                usage.input_tokens
+            );
+        }
+
         // Filter null-input tool_use blocks on MaxTokens truncation
         let blocks = if stop_reason == StopReason::MaxTokens {
             filter_null_input_tool_use(blocks)
@@ -1589,5 +1598,22 @@ mod tests {
         assert_eq!(reason, "block_limit_consecutive");
         assert_eq!(consecutive, 3);
         assert_eq!(total, 10);
+    }
+
+    // --- Prompt caching tests ---
+
+    #[test]
+    fn tool_schemas_have_no_cache_control() {
+        // cache_control is added at send time in send_message(), not in tool schemas.
+        // This ensures all_tool_schemas() returns clean schemas.
+        let schemas = all_tool_schemas();
+        assert!(!schemas.is_empty(), "should have tool schemas");
+        for schema in &schemas {
+            assert!(
+                schema.get("cache_control").is_none(),
+                "tool schema should not contain cache_control: {}",
+                schema["name"]
+            );
+        }
     }
 }

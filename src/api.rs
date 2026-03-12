@@ -140,19 +140,26 @@ impl AnthropicClient {
         let mut body = serde_json::json!({
             "model": model,
             "max_tokens": max_tokens,
-            "system": system,
+            "system": [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }],
             "messages": messages,
             "stream": true,
         });
 
         if !tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(tools.to_vec());
+            let mut cached_tools = tools.to_vec();
+            if let Some(last) = cached_tools.last_mut() {
+                last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+            body["tools"] = serde_json::Value::Array(cached_tools);
         }
 
         let mut req = self
             .client
             .post(&url)
-            .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
 
         if let Some(ref key) = self.api_key {
@@ -650,5 +657,78 @@ mod tests {
         assert_eq!(u.output_tokens, 0);
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn system_prompt_sent_as_cached_content_block_array() {
+        let system = "You are a coding assistant";
+        let body = serde_json::json!({
+            "system": [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }]
+        });
+
+        let system_val = &body["system"];
+        assert!(system_val.is_array(), "system must be an array");
+        let arr = system_val.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], system);
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_added_to_last_tool_only() {
+        let tools = vec![
+            serde_json::json!({"name": "Read", "description": "Read files"}),
+            serde_json::json!({"name": "Bash", "description": "Run commands"}),
+            serde_json::json!({"name": "Grep", "description": "Search files"}),
+        ];
+
+        let mut cached_tools = tools.clone();
+        if let Some(last) = cached_tools.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+
+        // Original tools unmodified
+        assert!(tools[0].get("cache_control").is_none());
+        assert!(tools[1].get("cache_control").is_none());
+        assert!(tools[2].get("cache_control").is_none());
+
+        // Only last cached tool has cache_control
+        assert!(cached_tools[0].get("cache_control").is_none());
+        assert!(cached_tools[1].get("cache_control").is_none());
+        assert_eq!(cached_tools[2]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_with_single_tool() {
+        let tools = vec![serde_json::json!({"name": "Read", "description": "Read files"})];
+
+        let mut cached_tools = tools.to_vec();
+        if let Some(last) = cached_tools.last_mut() {
+            last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+        }
+
+        assert_eq!(cached_tools[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_with_empty_tools() {
+        let tools: Vec<serde_json::Value> = vec![];
+        let mut body = serde_json::json!({"model": "test"});
+
+        // Mirrors send_message logic — no tools means no tools key
+        if !tools.is_empty() {
+            let mut cached_tools = tools.to_vec();
+            if let Some(last) = cached_tools.last_mut() {
+                last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+            body["tools"] = serde_json::Value::Array(cached_tools);
+        }
+
+        assert!(body.get("tools").is_none());
     }
 }

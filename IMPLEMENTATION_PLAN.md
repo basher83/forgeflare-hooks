@@ -1,10 +1,10 @@
 # Implementation Plan
 
-Phase 1: 9/9 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 15/15 fixed. 179 tests pass, clippy clean, fmt clean.
+Phase 1: 10/10 complete. Phase 2: 5/5 complete. Pre-existing bugs: 4/4 fixed. Tool hardening: 3/3 fixed. Schema fix: 1/1 fixed. Release fixes: 2/2 fixed. SSE error fix: 1/1 fixed. Test coverage gaps: 15/15 fixed. 179 tests pass, clippy clean, fmt clean.
 
 All planned work is complete.
 
-Updated 2026-03-12: Full spec-vs-implementation audit across all 16 specs. Three gaps found and fixed: (1) release workflow missing `--latest` flag (spec R4, v0.0.16); (2) actions/checkout SHA mismatch between ci.yml and release.yml (spec R6, v0.0.16); (3) unknown SSE error types classified as permanent instead of transient (api-retry spec R1, v0.0.17).
+Updated 2026-03-12: Full spec-vs-implementation audit across all 15 feature specs (16 files including the index). Three gaps found and fixed: (1) release workflow missing `--latest` flag (spec R4, v0.0.16); (2) actions/checkout SHA mismatch between ci.yml and release.yml (spec R6, v0.0.16); (3) unknown SSE error types classified as permanent instead of transient (api-retry spec R1, v0.0.17).
 
 Updated 2026-03-12: Second audit pass found two test coverage gaps in parallel dispatch path. Both fixed in v0.0.19: (1) null-input tool_use in parallel path — test verifies error ToolResult produced and post-hooks skipped via blocked_flags; (2) mid-batch threshold trip — test verifies already-spawned futures joined, threshold_tripped set, and empty result returned.
 
@@ -38,15 +38,18 @@ Full line-by-line audit of all specs against implementation. Results:
 
 - `classify_error` for `AgentError::Api(reqwest::Error)` timeout/connect branches: constructing a `reqwest::Error` requires actual network failures. The error classification logic is correct by inspection, but these specific branches have no unit test. Accepted constraint — not worth introducing a mock HTTP layer for two match arms.
 
-- `coding-agent.md` R4 lists `Glob(path?, recursive?)` — `recursive` parameter not implemented. The `glob` crate handles `**` patterns natively, making an explicit parameter redundant. The model uses `**/*.rs` directly.
-- `coding-agent.md` R4 lists `Bash(command, cwd?)` — `cwd` parameter not implemented. The model uses `cd dir && command` pattern. Claude Code itself omits this parameter.
 - Bash schema declares a `description` parameter that `bash_exec` never reads. Harmless — the model sends it for context but the tool ignores it. Not worth removing since it serves as documentation in the schema.
 
 ## Spec Errata
 
-- `release-workflow.md` line 77: success criteria says "working `agent` binary" — should say `forgeflare`.
-- `session-capture.md` JSONL example (line 101): uses snake_case `read_file` in tool_use name. Should be PascalCase `Read` per `tool-name-compliance.md`.
-- `glob-shell-injection.md` R2: said "filesystem order (platform-dependent)" — corrected to "alphabetical order" (v0.0.21).
+All previously tracked errata have been reconciled in the source specs (2026-04-28). Historical entries:
+
+- `coding-agent.md` R4 `Glob(path?, recursive?)` and `Bash(command, cwd?)` — the optional parameters were never implemented. Spec updated to drop them and document why inline.
+- `coding-agent.md` "Reference: Go Source" section and `/reference/go-source/` pin — removed (reference directory no longer exists; Rust implementation is the source of truth).
+- `release-workflow.md` success criteria — `agent` binary name corrected to `forgeflare`.
+- `session-capture.md` JSONL example — snake_case `read_file` corrected to PascalCase `Read` per `tool-name-compliance.md`.
+- `sse-buffer-optimization.md` success criteria — enumerated test list (originally 6) replaced with a non-enumerated criterion to prevent drift as the SSE test suite grows.
+- `glob-shell-injection.md` R2: "filesystem order (platform-dependent)" corrected to "alphabetical order" (v0.0.21).
 
 ## Minor Code Observations (not blocking)
 

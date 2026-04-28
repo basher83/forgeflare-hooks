@@ -76,13 +76,7 @@ Changes to existing code:
 ## Success Criteria
 
 - [ ] No `.to_string()` calls on buffer slices in the SSE event extraction loop
-- [ ] All 6 existing SSE parser tests pass unchanged
-- [ ] `parse_sse_text_response` — text streaming and block assembly
-- [ ] `parse_sse_tool_use_response` — tool input JSON accumulation
-- [ ] `parse_sse_error_event_transient` — overloaded_error handling
-- [ ] `parse_sse_error_event_permanent` — invalid_request_error handling
-- [ ] `parse_sse_missing_stop_reason` — connection drop detection
-- [ ] `parse_sse_usage_from_message_start_and_delta` — cache token parsing
+- [ ] All existing SSE parser tests pass unchanged (text response, tool use accumulation, error events, missing stop_reason, usage parsing, and edge cases)
 - [ ] `cargo clippy -- -D warnings` clean
 
 ---

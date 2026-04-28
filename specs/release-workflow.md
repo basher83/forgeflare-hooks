@@ -78,7 +78,7 @@ File: `.github/workflows/release.yml` (separate from `ci.yml`)
 - [ ] macOS aarch64 binary compiles and tests pass on Apple Silicon runner
 - [ ] Linux x86_64 binary compiles and tests pass on Ubuntu runner
 - [ ] Both tarballs attached to GitHub Release
-- [ ] Tarball extracts to a working `agent` binary on target platform
+- [ ] Tarball extracts to a working `forgeflare` binary on target platform
 - [ ] Release blocked if CI (lint, audit, test) fails
 - [ ] No release artifacts published on build failure
 - [ ] Action SHAs pinned, permissions least-privilege

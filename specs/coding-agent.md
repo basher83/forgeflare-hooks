@@ -36,11 +36,11 @@ tools! {
 - Tool schemas are sent with every API request, providing introspection natively
 - Macro generates schemas; dispatch is hand-written to support per-tool signatures (bash streaming)
 
-**R4. Five Tools**
-1. **Read** — Read(path) → file contents (handle binary, size limits)
-2. **Glob** — Glob(pattern) → [files]. The `glob` crate handles `**` natively, so no explicit `recursive` flag — the model uses `**/*.rs` directly.
+**R4. Five Tools** (argument names are the JSON keys sent by the model)
+1. **Read** — Read(file_path) → file contents (handle binary, size limits)
+2. **Glob** — Glob(pattern, path?) → [files]. `pattern` is the glob (e.g. `**/*.rs`), `path` is an optional base directory (default: cwd). The `glob` crate handles `**` natively, so no explicit `recursive` flag.
 3. **Bash** — Bash(command) → stdout/stderr (timeout, streaming output via callback). No `cwd` parameter — the model uses `cd dir && command` (matches Claude Code conventions).
-4. **Edit** — Edit(path, old_str, new_str, replace_all?) → success/error (exact match by default; replace_all=true for bulk changes; empty old_str on missing file = create with mkdir, empty old_str on existing file = append)
+4. **Edit** — Edit(file_path, old_str, new_str, replace_all?) → success/error (exact match by default; replace_all=true for bulk changes; empty old_str on missing file = create with mkdir, empty old_str on existing file = append)
 5. **Grep** — Grep(pattern, path?, file_type?, case_sensitive?) → matches (shell out to `rg`)
 
 **R5. CLI Interface**

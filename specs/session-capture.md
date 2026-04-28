@@ -102,7 +102,7 @@ User turn:
 Assistant turn with tool use:
 
 ```json
-{"type":"assistant","sessionId":"2026-02-10-uuid","uuid":"turn-uuid","parentUuid":"prev-uuid","timestamp":"2026-02-10T23:31:05Z","cwd":"/path/to/project","version":"0.0.44","message":{"role":"assistant","content":[{"type":"text","text":"Let me read that file."},{"type":"tool_use","id":"toolu_01X","name":"read_file","input":{"path":"src/main.rs"}}],"usage":{"input_tokens":1200,"output_tokens":350,"cache_creation_input_tokens":0,"cache_read_input_tokens":800}}}
+{"type":"assistant","sessionId":"2026-02-10-uuid","uuid":"turn-uuid","parentUuid":"prev-uuid","timestamp":"2026-02-10T23:31:05Z","cwd":"/path/to/project","version":"0.0.44","message":{"role":"assistant","content":[{"type":"text","text":"Let me read that file."},{"type":"tool_use","id":"toolu_01X","name":"Read","input":{"path":"src/main.rs"}}],"usage":{"input_tokens":1200,"output_tokens":350,"cache_creation_input_tokens":0,"cache_read_input_tokens":800}}}
 ```
 
 Tool result (part of next user turn):

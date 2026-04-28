@@ -1,0 +1,59 @@
+{
+  "cli_version": "0.5.6",
+  "checkpoint_id": "49cb4ee92bc6",
+  "session_id": "39c0b81c-43bc-48da-b8c9-9bb5656a21f6",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-28T14:28:11.065055Z",
+  "branch": "chore/security-bump-openssl-rustls-webpki",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "Cargo.lock"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-7[1m]",
+  "turn_id": "ccf4e8603b9b",
+  "token_usage": {
+    "input_tokens": 59,
+    "cache_creation_tokens": 31142,
+    "cache_read_tokens": 917312,
+    "output_tokens": 6427,
+    "api_call_count": 24
+  },
+  "session_metrics": {
+    "turn_count": 6
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-28T14:28:11.060761Z",
+    "agent_lines": 9,
+    "agent_removed": 9,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 9,
+    "total_lines_changed": 18,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 38,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/settings.local.json": 38
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 38,
+      "user_lines_removed": 0,
+      "agent_lines_added": 9,
+      "agent_lines_removed": 9,
+      "user_added_per_file": {
+        ".claude/settings.local.json": 38
+      }
+    }
+  ]
+}

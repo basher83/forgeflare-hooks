@@ -1,0 +1,21 @@
+review the repo, provide status and recent git history
+
+---
+
+lets pull and delete stale repo review
+
+---
+
+flip to https
+
+---
+
+yeah, thats old
+
+---
+
+yeah lets take a peek at depemdabot
+
+---
+
+run it

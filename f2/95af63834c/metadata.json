@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.5.6",
+  "checkpoint_id": "f295af63834c",
+  "strategy": "manual-commit",
+  "branch": "docs/reconcile-spec-errata",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "specs/coding-agent.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/f2/95af63834c/0/metadata.json",
+      "transcript": "/f2/95af63834c/0/full.jsonl",
+      "content_hash": "/f2/95af63834c/0/content_hash.txt",
+      "prompt": "/f2/95af63834c/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 11,
+    "cache_creation_tokens": 8277,
+    "cache_read_tokens": 517731,
+    "output_tokens": 4012,
+    "api_call_count": 6
+  }
+}

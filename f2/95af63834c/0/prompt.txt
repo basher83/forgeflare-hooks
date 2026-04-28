@@ -1,0 +1,9 @@
+107 merged, 108 coderabbit review: Verify each finding against the current code and only fix it if needed.
+
+In `@specs/coding-agent.md` around lines 39 - 45, Update the spec entry for the
+Read tool so its signature matches the actual JSON input key used by the Rust
+implementation: change "Read(path)" to "Read(file_path)" (or explicitly document
+that the "path" argument maps to the JSON field "file_path"); ensure the README
+line describing the tool (the Read entry in specs/coding-agent.md) uses the
+exact symbol file_path and add a brief parenthetical mapping if you want to
+preserve the colloquial "path" name.

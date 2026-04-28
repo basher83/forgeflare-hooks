@@ -1,0 +1,5 @@
+yeah lets open it
+
+---
+
+go source is no longer relavant, that was from a earlier version needs deprecation/removal. imp plan errata should be reconciled, bump version per loop convention

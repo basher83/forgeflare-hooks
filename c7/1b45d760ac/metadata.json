@@ -1,0 +1,29 @@
+{
+  "cli_version": "0.5.6",
+  "checkpoint_id": "c71b45d760ac",
+  "strategy": "manual-commit",
+  "branch": "docs/reconcile-spec-errata",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "IMPLEMENTATION_PLAN.md",
+    "specs/coding-agent.md",
+    "specs/release-workflow.md",
+    "specs/session-capture.md",
+    "specs/sse-buffer-optimization.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/c7/1b45d760ac/0/metadata.json",
+      "transcript": "/c7/1b45d760ac/0/full.jsonl",
+      "content_hash": "/c7/1b45d760ac/0/content_hash.txt",
+      "prompt": "/c7/1b45d760ac/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 81,
+    "cache_creation_tokens": 66590,
+    "cache_read_tokens": 1647400,
+    "output_tokens": 17266,
+    "api_call_count": 36
+  }
+}
